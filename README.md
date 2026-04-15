@@ -27,6 +27,20 @@ This script is designed for professional system administration. To ensure 100% a
 
 ---
 
+## 🖥 OS Compatibility
+
+The script is developed with a focus on POSIX compliance. 
+
+### Verified & Tested:
+- **CentOS Stream 9** (systemd)
+- **Alpine Linux 3.x** (OpenRC)
+
+### Planned / Likely Compatible:
+- **RHEL / Rocky Linux / AlmaLinux** (based on CentOS logic)
+- **Ubuntu / Debian** (APT logic implemented, testing in progress)
+
+---
+
 ## 🚀 Installation & Usage
 
 ### Option 1: Quick Run (One-liner)
