@@ -33,7 +33,7 @@ The script is developed with a focus on POSIX compliance.
 
 ### Verified & Tested:
 - **CentOS Stream 9** (systemd)
-- **Alpine Linux 3.x** (OpenRC)
+- **Alpine Linux 3.23.4** (OpenRC)
 
 ### Planned / Likely Compatible:
 - **RHEL / Rocky Linux / AlmaLinux** (based on CentOS logic)
