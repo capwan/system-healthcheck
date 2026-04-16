@@ -28,7 +28,7 @@ section_system() {
     echo -e "${G}Hostname:${NC} $(hostname)"
     echo -e "${G}Kernel:${NC} $(uname -r)"
     
-    # Расчет времени работы (человекочитаемый)
+    # Count worktime
     local up_sec=$(cut -d. -f1 /proc/uptime)
     local d=$((up_sec/86400)); local h=$((up_sec%86400/3600)); local m=$((up_sec%3600/60))
     local up_pretty=""; [ $d -gt 0 ] && up_pretty+="${d}d "; [ $h -gt 0 ] && up_pretty+="${h}h "; up_pretty+="${m}m"
