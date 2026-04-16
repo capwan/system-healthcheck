@@ -50,7 +50,7 @@ curl -sSL https://raw.githubusercontent.com/capwan/system-healthcheck/main/healt
 
 ### Option 2: Manual setup 
 ```bash
-git clone [https://github.com/capwan/system-healthcheck.git](https://github.com/capwan/system-healthcheck.git)
+git clone https://github.com/capwan/system-healthcheck.git
 cd system-healthcheck
 chmod +x healthcheck.sh
 sudo ./healthcheck.sh
