@@ -63,8 +63,8 @@ sudo ./healthcheck.sh
 
 I am actively working on enhancing the core functionality. Here is what's coming next:
 
-- [ ] **Strict Root Validation** — Implementing a formal pre-flight check to verify EUID at runtime to prevent partial data execution.
-- [ ] **CPU Steal Time Analysis** — Adding logic to detect "Steal Time" to identify resource contention (crucial for VMware/AWS/GCP nodes).
-- [ ] **Service Health Monitor** — Integration of `systemd` and `OpenRC` checks to automatically list crashed or failed services.
-- [ ] **JSON Output Mode** — Optional flag to generate machine-readable reports for integration with external monitoring tools.
+- [x] **Strict Root Validation** — Implementing a formal pre-flight check to verify EUID at runtime to prevent partial data execution.
+- [x] **CPU Steal Time Analysis** — Adding logic to detect "Steal Time" to identify resource contention (crucial for VMware/AWS/GCP nodes).
+- [x] **Service Health Monitor** — Integration of `systemd` and `OpenRC` checks to automatically list crashed or failed services.
+- [x] **JSON Output Mode** — Optional flag to generate machine-readable reports for integration with external monitoring tools.
 
