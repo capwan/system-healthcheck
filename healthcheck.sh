@@ -1,29 +1,8 @@
 #!/usr/bin/env bash
 
 # ============================================================================
-# system-healthcheck v0.1.0 | Release date : 18.04.2026
+# system-healthcheck v0.1.1 | Release date : 26.04.2026
 # Author : Rahman Samadzada (capwan)
-# FEATURES:
-#   - Strict root validation with EUID check (warning only, non-blocking)
-#   - CPU steal time analysis via /proc/stat (1-second sample)
-#   - CPU Usage % calculation (idle time delta)
-#   - Service health monitoring: systemd + OpenRC (Alpine) support
-#   - JSON output mode with safe string escaping for machine parsing
-#   - Global alert accumulator for unified issue reporting
-#   - safe_exec wrapper with timeout to prevent hangs on slow I/O
-#   - Zombie process detection with PID output
-#   - Strict dangerous port matching with word-boundary regex
-#   - Failed service details (first N units) with configurable limit
-#   - Logging to /var/log or current directory with timestamped filenames
-#
-# FIXES:
-#   - Disabled job control (set +m) for Alpine/Bash compatibility
-#   - Removed Unicode bullet (●) from systemctl output parsing
-#   - Fixed regex for port detection to avoid partial matches
-#   - Added json_escape() to prevent invalid JSON on special characters
-#   - Added OpenRC fallback for service checks on Alpine Linux
-#   - Fixed missing $log_f definition in security section
-# ============================================================================
 
 # Exit immediately if a pipeline returns non-zero (strict error handling)
 set -o pipefail
@@ -35,6 +14,7 @@ set +m
 # ============================================================================
 THRESHOLD_DISK=90                 # Disk usage alert threshold (%)
 THRESHOLD_LOAD=0.9                # Load average threshold (not yet used in alerts)
+THRESHOLD_SWAP=50                 # Swap usage alert threshold (%)
 DANGER_PORTS_LIST="21 23 161 3389 5900 6379 27017 5432 3306"  # Risky ports to monitor (space-separated)
 
 # ============================================================================
@@ -130,7 +110,7 @@ get_failed_services_details() {
     local services="$1"
     local count=0
     local limit="${FAILED_DETAILS_LIMIT:-3}"
-    
+
     for svc in $services; do
         [[ $count -ge $limit ]] && break
         if command -v systemctl >/dev/null 2>&1; then
@@ -150,7 +130,7 @@ section_system() {
     local os=$(get_val PRETTY_NAME)
     local host=$(hostname)
     local kernel=$(uname -r)
-    
+
     # Calculate uptime in human-readable format (Xd Xh Xm)
     local up_sec=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
     local d=$((up_sec/86400))
@@ -160,22 +140,34 @@ section_system() {
     [[ "$d" -gt 0 ]] && up_pretty+="${d}d "
     [[ "$h" -gt 0 ]] && up_pretty+="${h}h "
     up_pretty+="${m}m"
-    
-    # Detect virtualization environment with fallbacks
-    # Primary: systemd-detect-virt (covers most cases)
-    # Fallbacks: grep checks for common hypervisors, container markers, DMI/sysfs
+
+    # ========================================================================
+    # VIRTUALIZATION DETECTION
+    # Priority order:
+    # 1. systemd-detect-virt (most reliable, covers 90% of cases)
+    # 2. CPU flags for common hypervisors
+    # 3. DMI/sysfs checks for specific hypervisors
+    # ========================================================================
     local virt="physical"
+    
+    # Primary: systemd-detect-virt (returns: kvm, vmware, none, etc.)
     if command -v systemd-detect-virt >/dev/null 2>&1; then
-        virt=$(systemd-detect-virt 2>/dev/null || echo "unknown")
-        [[ "$virt" == "none" || -z "$virt" ]] && virt="physical"
+        virt=$(systemd-detect-virt 2>/dev/null)
+        [[ "$?" -ne 0 || -z "$virt" || "$virt" == "none" ]] && virt="physical"
+    
+    # Fallback 1: Check CPU flags for hypervisor signatures
     elif grep -iEq "vmware|kvm|qemu|xen|hyperv|virtualbox" /proc/cpuinfo 2>/dev/null; then
         virt="virtual"
-    elif [[ -f /.dockerenv ]] || grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
-        virt="container"
+
+    # OpenVZ: /proc/vz exists but /proc/bc does not (VE vs HA)
     elif [[ -d /proc/vz ]] && [[ ! -d /proc/bc ]]; then
         virt="openvz"
+    
+    # Hyper-V: DMI sys_vendor check
     elif grep -qi "microsoft corporation" /sys/class/dmi/id/sys_vendor 2>/dev/null; then
         virt="hyperv"
+    
+    # Xen: hypervisor type check
     elif grep -qi "xen" /sys/hypervisor/type 2>/dev/null; then
         virt="xen"
     fi
@@ -183,7 +175,7 @@ section_system() {
     # Check for failed services - supports both systemd and OpenRC (Alpine)
     local failed_c=0
     local failed_names=""
-    
+
     if command -v systemctl >/dev/null 2>&1; then
         # systemd-based systems: list failed units, extract names
         failed_c=$(systemctl list-units --state=failed --no-legend 2>/dev/null | wc -l)
@@ -194,21 +186,28 @@ section_system() {
         failed_c=$(rc-status --all 2>/dev/null | grep -cE "stopped|crashed" || echo 0)
         failed_names=$(rc-status --all 2>/dev/null | grep -E "stopped|crashed" | awk '{print $1}' | head -n 5 | xargs)
     fi
-    
+
     # Store in global vars for cross-section access (health verdict, alerts)
     GLOBAL_FAILED_SERVICES="$failed_names"
     GLOBAL_FAILED_COUNT="$failed_c"
     [[ "$failed_c" -gt 0 ]] && add_alert "FAILED SERVICES: $failed_c ($failed_names)"
-    
+
     # Check NTP service status via process name matching
     local ntp_active="inactive"
     pgrep -x "chronyd|ntpd|systemd-timesyncd|ntp" >/dev/null 2>&1 && ntp_active="active"
 
+    # Check kernel taint status (non-zero = proprietary modules, OOM, crash, etc.)
+    local taint=$(cat /proc/sys/kernel/tainted 2>/dev/null || echo "0")
+    if [[ "$taint" != "0" ]]; then
+        [[ "$JSON_MODE" != "true" ]] && echo -e "${Y}⚠ Kernel tainted: code $taint (check dmesg)${NC}"
+        add_alert "KERNEL: Tainted (code: $taint)"
+    fi
+
     if [[ "$JSON_MODE" == "true" ]]; then
         # JSON output with escaped strings to prevent invalid JSON
-        printf '"system": {"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s"}' \
+        printf '"system": {"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s", "tainted": %s}' \
             "$(json_escape "$os")" "$(json_escape "$host")" "$(json_escape "$up_pretty")" \
-            "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")"
+            "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")" "$taint"
     else
         echo -e "${B}=== System Info ===${NC}"
         echo -e "${G}OS:${NC} $os"
@@ -217,13 +216,13 @@ section_system() {
         echo -e "${G}Uptime:${NC} $up_pretty"
         echo -e "${G}Virt:${NC} $virt"
         echo -e "${G}Failed Services:${NC} $failed_c ${Y}${failed_names}${NC}"
-        
+
         # Show detailed status for failed services (non-JSON mode only)
         if [[ "$failed_c" -gt 0 && -n "$failed_names" ]]; then
             echo -e "${Y}--- Failed Service Details ---${NC}"
             get_failed_services_details "$failed_names"
         fi
-        
+
         echo -e "${G}NTP service:${NC} $ntp_active"
         echo -e "${G}Current Time:${NC} $(date)"
     fi
@@ -236,39 +235,39 @@ section_cpu() {
     # Get CPU model name, fallback to architecture if not available
     local model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')
     [[ -z "$model" ]] && model=$(uname -m)
-    
+
     local cores=$(nproc 2>/dev/null || echo 1)
     local load=$(cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)
-    
+
     # Calculate CPU usage metrics via /proc/stat sampling
     # Reads CPU stats, waits 1 second, reads again, calculates deltas
     local stat1=$(grep '^cpu ' /proc/stat 2>/dev/null)
     sleep 1
     local stat2=$(grep '^cpu ' /proc/stat 2>/dev/null)
-    
+
     # Sum all CPU time fields (user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice)
     # Field order: 2=user, 3=nice, 4=system, 5=idle, 6=iowait, 7=irq, 8=softirq, 9=steal, 10=guest, 11=guest_nice
     local tot1=$(echo "$stat1" | awk '{print $2+$3+$4+$5+$6+$7+$8+$9+$10}')
     local tot2=$(echo "$stat2" | awk '{print $2+$3+$4+$5+$6+$7+$8+$9+$10}')
     local diff=$((tot2 - tot1))
-    
+
     local iowait_f=0
     local steal_f=0
-    local cpu_usage=0  # NEW: Track overall CPU utilization (100 - idle%)
+    local cpu_usage=0  # Track overall CPU utilization (100 - idle%)
 
     if [[ "$diff" -gt 0 ]]; then
         # Calculate I/O Wait percentage: field 6 in /proc/stat
         local iowait1=$(echo "$stat1" | awk '{print $6}')
         local iowait2=$(echo "$stat2" | awk '{print $6}')
         iowait_f=$(( 100 * (iowait2 - iowait1) / diff ))
-        
+
         # Calculate CPU Steal percentage: field 9 in /proc/stat
         # Crucial for detecting resource contention in VMs (AWS/GCP/VMware)
         local steal1=$(echo "$stat1" | awk '{print $9}')
         local steal2=$(echo "$stat2" | awk '{print $9}')
         steal_f=$(( 100 * (steal2 - steal1) / diff ))
 
-        # === NEW: CPU Usage % ===
+        # === CPU Usage % ===
         # Idle time is field 5 in /proc/stat
         # Formula: cpu_usage = 100 - (idle_delta * 100 / total_delta)
         local idle1=$(echo "$stat1" | awk '{print $5}')
@@ -278,7 +277,6 @@ section_cpu() {
         # Clamp to valid range [0, 100] to handle edge cases
         [[ "$cpu_usage" -lt 0 ]] && cpu_usage=0
         [[ "$cpu_usage" -gt 100 ]] && cpu_usage=100
-        # =========================================
     fi
 
     # Alert on high steal time (>10% indicates potential noisy neighbor in virtualized env)
@@ -300,6 +298,13 @@ section_cpu() {
         echo -e "${G}CPU Usage:${NC} ${cpu_usage}%"
         [[ "$steal_f" -gt 10 ]] && echo -e "${Y}⚠ High steal time may indicate VM resource contention${NC}"
         [[ "$cpu_usage" -gt 85 ]] && echo -e "${Y}⚠ High CPU usage detected${NC}"
+
+        # === NEW: Top 3 Processes by CPU and Memory ===
+        echo -e "\n${B}=== Top Processes ===${NC}"
+        echo -e "${G}By CPU:${NC}"
+        ps -eo pid,pcpu,comm --sort=-pcpu 2>/dev/null | head -n 4 | tail -n 3 | awk '{printf "    - PID %s: %s%% (%s)\n", $1, $2, $3}'
+        echo -e "${G}By Memory:${NC}"
+        ps -eo pid,pmem,comm --sort=-pmem 2>/dev/null | head -n 4 | tail -n 3 | awk '{printf "    - PID %s: %s%% (%s)\n", $1, $2, $3}'
     fi
 }
 
@@ -312,7 +317,7 @@ section_storage() {
         local root_usage=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
         root_usage="${root_usage:-0}"
         printf ', "storage": {"root_usage": %d}' "$root_usage"
-        
+
         # Alert on high disk usage via global accumulator
         is_greater "$root_usage" "$THRESHOLD_DISK" && add_alert "DISK SPACE LOW: ${root_usage}%"
     else
@@ -320,10 +325,10 @@ section_storage() {
         echo -e "${G}Mounts:${NC}"
         # Use timeout to prevent hang on unresponsive mounts (NFS, slow disks)
         safe_exec 2 df -h 2>/dev/null | grep -E '^/dev/|^/|cs-root' | sed 's/^/  /' || echo "  df command timed out"
-        
+
         echo -e "${G}Inodes:${NC}"
         safe_exec 2 df -i 2>/dev/null | grep -E '^/dev/|^/|cs-root' | sed 's/^/  /' || echo "  df -i timed out"
-        
+
         echo -e "${G}Block Devices (lsblk):${NC}"
         safe_exec 2 lsblk -e 7 2>/dev/null | sed 's/^/  /' || echo "  lsblk not available or timed out"
     fi
@@ -335,7 +340,7 @@ section_storage() {
 section_network() {
     local gw=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -n1)
     local dns=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs)
-    
+
     if [[ "$JSON_MODE" == "true" ]]; then
         printf ', "network": {"gateway": "%s", "dns": "%s"}' \
             "$(json_escape "${gw:-N/A}")" "$(json_escape "$dns")"
@@ -343,7 +348,7 @@ section_network() {
         echo -e "\n${B}=== Network ===${NC}"
         # Try ip command (modern), fallback to ifconfig (legacy)
         safe_exec 2 ip -4 -br addr 2>/dev/null || safe_exec 2 ifconfig -a 2>/dev/null | grep "inet " | awk '{print $1, $2}'
-        
+
         echo -e "${G}Gateway:${NC} ${gw:-N/A}"
         echo -e "${G}DNS:${NC} $dns"
         echo -e "${G}Listening Ports (Top 15):${NC}"
@@ -363,66 +368,136 @@ section_security() {
     elif command -v ufw >/dev/null 2>&1; then
         fw=$(safe_exec 2 ufw status 2>/dev/null | head -n1 | awk '{print $2}')
     fi
-    
-    # Check SSH root login configuration from sshd_config
+
+    # Check SSH root login configuration
     local ssh_root=$(grep -i "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    [[ -z "$ssh_root" ]] && ssh_root="prohibit-password"  # Default if not set
-    
-    # Count pending updates (dnf for RHEL/CentOS, apt for Debian/Ubuntu)
+    [[ -z "$ssh_root" ]] && ssh_root="prohibit-password"
+
+    # Count pending updates
     local upd=0
     if command -v dnf >/dev/null 2>&1; then
         upd=$(safe_exec 10 dnf check-update -q 2>/dev/null | grep -v "^$" | wc -l)
     elif command -v apt-get >/dev/null 2>&1; then
         upd=$(safe_exec 10 apt-get -s upgrade 2>/dev/null | grep -Po '^\d+(?= upgraded)')
     fi
-    # Sanitize: keep only digits, default to 0 if empty
     upd=$(echo "$upd" | tr -dc '0-9')
     upd=${upd:-0}
 
-    # Define log file path BEFORE using it (critical fix)
-    # Order: Debian/Ubuntu → RHEL/CentOS → fallback
-    local log_f="/var/log/auth.log"
-    [[ ! -f "$log_f" ]] && log_f="/var/log/secure"
-    [[ ! -f "$log_f" ]] && log_f="/var/log/messages"
+    # ========================================================================
+    # SSH SECURITY: Historical Failures + Active Sessions + Alert
+    # ========================================================================
+    local ssh_total_failures=0
+    local ssh_top_ips=""
+    local ssh_active_sessions=""
 
-    # Count Failed password attempts (strict integer, no newlines)
-    local brutes=0
-    if [[ -f "$log_f" ]]; then
-        # awk reliably counts matching lines, returns 0 if none found
-        brutes=$(awk '/Failed password/ {c++} END {print c+0}' "$log_f" 2>/dev/null)
+    # 1. Historical failed attempts (lastb -> text logs fallback)
+    if command -v lastb >/dev/null 2>&1; then
+        ssh_top_ips=$(lastb 2>/dev/null | awk '{print $3}' | \
+                      grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]{7,}$' | \
+                      grep -vE '^127\.|^::1$|localhost|console|tty' | \
+                      sort | uniq -c | sort -rn | head -n 5)
+    else
+        local ssh_log="/var/log/auth.log"
+        [[ ! -f "$ssh_log" ]] && ssh_log="/var/log/secure"
+        [[ ! -f "$ssh_log" ]] && ssh_log="/var/log/messages"
+
+        if command -v logread >/dev/null 2>&1 && [[ ! -f "$ssh_log" ]]; then
+            ssh_top_ips=$(logread -e "Failed\|invalid\|authentication" 2>/dev/null | \
+                          awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' | \
+                          grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]{7,}$' | \
+                          sort | uniq -c | sort -rn | head -n 5)
+        elif [[ -f "$ssh_log" ]]; then
+            ssh_top_ips=$(tail -n 20000 "$ssh_log" 2>/dev/null | \
+                          awk '/[Ff]ailed password/ {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' | \
+                          grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]{7,}$' | \
+                          sort | uniq -c | sort -rn | head -n 5)
+        fi
     fi
-    # Double-sanitize: remove any non-digits, default to 0
-    brutes=$(printf '%s' "$brutes" | tr -dc '0-9')
-    brutes=${brutes:-0}
 
-    # Detect dangerous ports with strict regex (word boundary to avoid partial matches)
-    # Regex matches :PORT followed by non-digit or end-of-line (e.g., :22 but not :2222)
+    if [[ -n "$ssh_top_ips" ]]; then
+        ssh_total_failures=$(echo "$ssh_top_ips" | awk '{sum+=$1} END {print sum+0}')
+    fi
+
+    # 2. Active SSH sessions (ESTABLISHED on port 22)
+    if command -v ss >/dev/null 2>&1; then
+        ssh_active_sessions=$(ss -tnp 2>/dev/null | grep ':22 ' | grep ESTAB | awk '{print $5}' | cut -d: -f1 | sort -u)
+    elif command -v netstat >/dev/null 2>&1; then
+        ssh_active_sessions=$(netstat -tnp 2>/dev/null | grep ':22 ' | grep ESTABLISHED | awk '{print $5}' | cut -d: -f1 | sort -u)
+    fi
+
+    # 3. ADD TO GLOBAL ALERTS (Fixes missing summary entry)
+    if [[ "$ssh_total_failures" -gt 0 ]]; then
+        local top_ip=$(echo "$ssh_top_ips" | head -1 | awk '{print $2}')
+        [[ -n "$top_ip" ]] && add_alert "SSH AUTH FAILURES: ${ssh_total_failures} attempts (Top: $top_ip)"
+    fi
+
+    # ========================================================================
+    # OUTPUT GENERATION
+    # ========================================================================
+    if [[ "$JSON_MODE" != "true" ]]; then
+        echo -e "\n${B}=== Security & Updates ===${NC}"
+        echo -e "${G}Firewall:${NC} $fw"
+        echo -e "${G}SSH PermitRootLogin:${NC} $ssh_root"
+        echo -e "${G}SSH Auth Failures:${NC} ${ssh_total_failures} attempts"
+
+        if [[ -n "$ssh_top_ips" ]]; then
+            echo -e "${Y}Top Source IPs (Historical):${NC}"
+            echo "$ssh_top_ips" | awk '{printf "    - %-22s (%d attempts)\n", $2, $1}'
+        fi
+
+        echo -e "${G}Active SSH Sessions:${NC}"
+        if [[ -n "$ssh_active_sessions" ]]; then
+            echo "$ssh_active_sessions" | while read -r ip; do [[ -n "$ip" ]] && echo "    - $ip"; done
+        else
+            echo "    None"
+        fi
+    else
+        # JSON output
+        local ip_json="["
+        if [[ -n "$ssh_top_ips" ]]; then
+            local first=true
+            while read -r count ip; do
+                [[ -z "$ip" ]] && continue
+                $first || ip_json+=","
+                ip_json+="{\"ip\":\"$ip\",\"attempts\":$count}"
+                first=false
+            done <<< "$ssh_top_ips"
+        fi
+        ip_json+="]"
+
+        local active_json="["
+        if [[ -n "$ssh_active_sessions" ]]; then
+            local first=true
+            while read -r ip; do
+                [[ -z "$ip" ]] && continue
+                $first || active_json+=","
+                active_json+="\"$ip\""
+                first=false
+            done <<< "$ssh_active_sessions"
+        fi
+        active_json+="]"
+
+        printf ', "security": {"firewall": "%s", "ssh_root": "%s", "updates": %d, "ssh_failures": %d, "top_ips": %s, "active_sessions": %s}' \
+            "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$upd" "$ssh_total_failures" "$ip_json" "$active_json"
+    fi
+
+    # Dangerous ports detection (unchanged)
     local regex=":($(echo $DANGER_PORTS_LIST | tr ' ' '|'))([^0-9]|$)"
     local found=$( (safe_exec 2 ss -tulpn -H 2>/dev/null || safe_exec 2 netstat -tulpn 2>/dev/null) | \
                    grep -E "$regex" | \
                    awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) print $i}' | \
                    sed 's/.*://' | sort -u | xargs)
-    
+
     GLOBAL_FOUND_PORTS="$found"
     [[ -n "$found" ]] && add_alert "SECURITY: Dangerous ports open ($found)"
 
-    if [[ "$JSON_MODE" == "true" ]]; then
-        printf ', "security": {"firewall": "%s", "ssh_root": "%s", "updates": %d, "brute_attempts": %d}' \
-            "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$upd" "$brutes"
-    else
-        echo -e "\n${B}=== Security & Updates ===${NC}"
-        echo -e "${G}Firewall:${NC} $fw"
-        echo -e "${G}SSH PermitRootLogin:${NC} $ssh_root"
-        # Use printf to avoid echo -e interpreting special chars in $brutes
-        printf "${G}SSH Auth Failures:${NC} %s attempts\n" "$brutes"
-        
+    if [[ "$JSON_MODE" != "true" ]]; then
         echo -n -e "${G}Dangerous Ports: ${NC}"
         if [[ -z "$found" ]]; then
             echo -e "${G}None detected${NC}"
         else
             echo -e "${R}DETECTED: $found${NC}"
         fi
-        
         echo -e "${G}Pending Updates:${NC} $upd"
     fi
 }
@@ -435,6 +510,14 @@ check_health_verdict() {
     local root_u=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
     root_u="${root_u:-0}"
     is_greater "$root_u" "$THRESHOLD_DISK" && add_alert "Disk space LOW: ${root_u}%"
+
+    # Check swap usage (alert if > THRESHOLD_SWAP %)
+    local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+    local swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null)
+    if [[ -n "$swap_total" && "$swap_total" -gt 0 ]]; then
+        local swap_used_pct=$(( 100 * (swap_total - swap_free) / swap_total ))
+        [[ "$swap_used_pct" -gt "$THRESHOLD_SWAP" ]] && add_alert "SWAP USAGE: ${swap_used_pct}% (memory pressure)"
+    fi
 
     # Detect zombie processes with PID output
     # ps -o pid,stat: filter rows where STAT column starts with 'Z'
@@ -453,9 +536,9 @@ check_health_verdict() {
     else
         echo -e "\n${G}--- Recent Errors (Quick Look) ---${NC}"
         safe_exec 2 dmesg 2>/dev/null | tail -n 3 | sed 's/^/  /' || echo "  dmesg unavailable"
-        
+
         echo -e "\n${B}================================================================${NC}"
-        
+
         if [[ -z "$GLOBAL_ALERTS" ]]; then
             echo -e "System health status: ${G}No critical issues found${NC}"
         else
@@ -463,7 +546,7 @@ check_health_verdict() {
             # Output accumulated alerts, remove empty lines, indent for readability
             echo -e "${R}${GLOBAL_ALERTS}${NC}" | sed '/^$/d' | sed 's/^/  /'
         fi
-        
+
         echo -e "\nReport generated at: $(date '+%Y-%m-%d %H:%M:%S')"
         echo -e "${B}========================= End of Report =========================${NC}"
     fi
@@ -508,20 +591,20 @@ run_main() {
         echo -e "${B}            SYSTEM AUDIT REPORT | $START_TIME_RAW ${NC}"
         echo -e "${B}================================================================${NC}"
     fi
-    
-    section_system    # OS, hostname, uptime, virtualization, failed services
-    section_cpu       # CPU model, cores, load, iowait, steal, usage%
-    
+
+    section_system    # OS, hostname, uptime, virtualization, failed services, kernel taint
+    section_cpu       # CPU model, cores, load, iowait, steal, usage%, top processes
+
     # Memory section (text output only, not included in JSON)
     if [[ "$JSON_MODE" != "true" ]]; then
         echo -e "\n${B}=== Memory ===${NC}"
         safe_exec 2 free -h 2>/dev/null || safe_exec 2 free 2>/dev/null || echo "  free command unavailable"
     fi
-    
+
     section_storage   # Disk usage, inodes, block devices
     section_network   # Interfaces, gateway, DNS, listening ports
     section_security  # Firewall, SSH config, updates, brute-force attempts, dangerous ports
-    check_health_verdict  # Final status with accumulated alerts
+    check_health_verdict  # Final status with accumulated alerts (disk, swap, zombies)
 }
 
 # Handle logging or direct output
@@ -531,7 +614,7 @@ if [[ "$SAVE_LOG" == "true" ]]; then
         # Fallback to current directory if /var/log is not writable
         DEST_LOG="./$LOG_NAME"
     fi
-    
+
     if [[ "$JSON_MODE" == "true" ]]; then
         # JSON: just tee to file (no colors anyway)
         run_main | tee "$DEST_LOG"
@@ -540,7 +623,7 @@ if [[ "$SAVE_LOG" == "true" ]]; then
         # Process substitution: tee sends to both stdout and sed (which strips ANSI codes)
         run_main | tee >(sed 's/\x1b\[[0-9;]*m//g' > "$DEST_LOG")
     fi
-    
+
     [[ "$JSON_MODE" != "true" ]] && echo -e "\n${Y}Log file created: ${DEST_LOG}${NC}"
 else
     run_main  # Direct output to stdout
