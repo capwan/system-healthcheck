@@ -44,7 +44,7 @@ A lightweight, high-performance Bash script for rapid server audits and health m
 - Fixed `section_storage()` skipping disk usage alert collection in `--quiet` mode
   (the `df` check now runs silently to populate `GLOBAL_ALERTS` regardless of output mode)
 
-### v0.0.1  (Previous Release)
+### v0.1.1  (Previous Release)
 - SSH Security Tracking: Reworked SSH failure detection with historical IP analysis, active session monitoring, and automatic alert aggregation
 - Kernel Taint Status: Detection of tainted kernel state (proprietary modules, OOM, crashes) via /proc/sys/kernel/tainted
 - Swap Usage Alert: Memory pressure warning when swap usage exceeds configurable threshold (default: 50%)
