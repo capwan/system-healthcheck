@@ -628,3 +628,4 @@ if [[ "$SAVE_LOG" == "true" ]]; then
 else
     run_main  # Direct output to stdout
 fi
+
