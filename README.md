@@ -1,4 +1,4 @@
-# system-healthcheck (`v0.1.1`)
+# system-healthcheck (`v0.1.2`)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0+-blue.svg)](https://www.gnu.org/software/bash/)
@@ -10,38 +10,49 @@ A lightweight, high-performance Bash script for rapid server audits and health m
 
 ## 🔄 Changelog
 
-### v0.1.1 (Current)
+### v0.1.2 (Current)
 
 #### ✨ New Features
 
-- **SSH Security Tracking**: Reworked SSH failure detection with historical IP analysis, active session monitoring, and automatic alert aggregation
-- **Kernel Taint Status**: Detection of tainted kernel state (proprietary modules, OOM, crashes) via `/proc/sys/kernel/tainted`
-- **Swap Usage Alert**: Memory pressure warning when swap usage exceeds configurable threshold (default: 50%)
-- **Top Processes Overview**: Real-time display of top 3 CPU and memory consuming processes for quick diagnostics
+- **`--quiet` / `-q` flag**: Suppresses all section output and shows only the final
+  health verdict with accumulated alerts. All checks still run in full — only the
+  display is silenced. Ideal for cron jobs, monitoring pipelines, and alert-only logging.
+- **OOM Kill Detection**: Scans the kernel ring buffer (`dmesg`) for Out-of-Memory kill
+  events. Reports total OOM kill count with the most recent event in `GLOBAL_ALERTS`.
+  JSON output gains a new `health.oom_kills` field.
 
 #### 🔧 Improvements
 
-- **Virtualization Detection**: Simplified fallback chain for better compatibility across minimal containers and older kernels
-- **Alert Aggregation**: All new checks integrate with `GLOBAL_ALERTS` for unified critical issue reporting
-- **JSON Safety**: Added `tainted` field to system JSON output; ensured all new string values are properly escaped
-- **Performance**: All new features add <30ms total overhead; zero external dependencies required
+- **Memory section fully supported in JSON mode**: `--json` output now includes a
+  `memory` key with structured RAM and swap metrics parsed from `/proc/meminfo`
+  (`ram_total_mb`, `ram_used_mb`, `ram_used_pct`, `swap_total_mb`, `swap_used_mb`,
+  `swap_used_pct`). Previously the key was entirely absent, returning `null` on `jq .memory`.
+- **Exit code reflects health status**: Script now exits with code `1` when any critical
+  alerts are present, and `0` when the system is clean. Enables native shell-level
+  integration: `./healthcheck.sh || send_alert`. JSON consumers can continue using
+  `.health.status == "CRITICAL"` — the exit code is an additional primitive.
+- **`CPU_SAMPLE_SEC` environment variable now applied**: The variable was documented in
+  `--help` since v0.0.1 but the `sleep` call in `section_cpu()` was hardcoded to `1`.
+  Now correctly uses `${CPU_SAMPLE_SEC:-1}`.
+- **`--help` updated**: Documents `--quiet`, `THRESHOLD_DISK`, `THRESHOLD_SWAP`, and
+  flag combination examples.
 
 #### 🐛 Bug Fixes
 
-- Fixed `Virt:` output showing duplicate lines (`none` + `unknown`) on Proxmox hosts
-- Fixed `SSH Auth Failures` appearing twice in output due to legacy code remnants
-- Fixed strict IP regex filtering out valid IPv6 addresses in SSH failure logs
-- Fixed `json_escape()` not being applied to all dynamic string values in JSON mode
+- Fixed kernel taint inline warning being printed even in `--quiet` mode. The alert is
+  now always added to `GLOBAL_ALERTS`; the inline `echo` is suppressed when appropriate.
+- Fixed `section_storage()` skipping disk usage alert collection in `--quiet` mode
+  (the `df` check now runs silently to populate `GLOBAL_ALERTS` regardless of output mode)
 
 ### v0.0.1  (Previous Release)
-- CPU Usage % calculation via /proc/stat idle delta
-- JSON output mode (--json) for machine-readable reports
-- Logging support (--log) for timestamped reports with ANSI codes stripped
-- Global alert accumulator for unified issue reporting
-- Failed service details (first N units via FAILED_DETAILS_LIMIT)
-- Root validation warning (non-blocking EUID check)
-- Zombie process PID output
-- Strict dangerous port regex (word-boundary matching)
+- SSH Security Tracking: Reworked SSH failure detection with historical IP analysis, active session monitoring, and automatic alert aggregation
+- Kernel Taint Status: Detection of tainted kernel state (proprietary modules, OOM, crashes) via /proc/sys/kernel/tainted
+- Swap Usage Alert: Memory pressure warning when swap usage exceeds configurable threshold (default: 50%)
+- Top Processes Overview: Real-time display of top 3 CPU and memory consuming processes for quick diagnostics
+- Virtualization Detection: Simplified fallback chain for better compatibility across minimal containers and older kernels
+- Alert Aggregation: All new checks integrate with GLOBAL_ALERTS for unified critical issue reporting
+- JSON Safety: Added tainted field to system JSON output; ensured all new string values are properly escaped
+- Performance: All new features add <30ms total overhead; zero external dependencies required
 
 ---
 
