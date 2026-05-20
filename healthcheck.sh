@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ============================================================================
-# system-healthcheck v0.1.1 | Release date : 26.04.2026
+# system-healthcheck v0.1.2 | Release date : 20.05.2026
 # Author : Rahman Samadzada (capwan)
 
 # Exit immediately if a pipeline returns non-zero (strict error handling)
@@ -22,6 +22,7 @@ DANGER_PORTS_LIST="21 23 161 3389 5900 6379 27017 5432 3306"  # Risky ports to m
 # ============================================================================
 JSON_MODE=false                   # Output machine-readable JSON if true (via --json flag)
 SAVE_LOG=false                    # Save report to file if true (via --log flag)
+QUIET_MODE=false                  # Suppress section output, show only health verdict (via --quiet/-q flag)
 START_TIME_RAW=$(date '+%Y-%m-%d %H:%M:%S')  # Timestamp for report header
 LOG_NAME="system-healthcheck$(date '+%Y%m%d-%H%M%S').log"  # Timestamped log filename
 
@@ -36,7 +37,7 @@ GLOBAL_FOUND_PORTS=""             # Detected dangerous ports (for cross-section 
 # ============================================================================
 
 # Extract value from /etc/os-release by key name
-# Usage: get_val PRETTY_NAME → returns "Ubuntu 22.04 LTS" or "N/A"
+# Usage: get_val PRETTY_NAME -> returns "Ubuntu 22.04 LTS" or "N/A"
 get_val() {
     grep "$1" /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "N/A"
 }
@@ -62,7 +63,7 @@ setup_colors() {
 # Allows non-root runs for partial data (e.g., viewing kernel version)
 check_root() {
     if [[ "$EUID" -ne 0 ]]; then
-        echo -e "${Y}⚠ Warning: Not running as root. Some data may be incomplete.${NC}" >&2
+        echo -e "${Y}Warning: Not running as root. Some data may be incomplete.${NC}" >&2
         echo -e "${Y}  Tip: Use 'sudo $0' for full system access.${NC}" >&2
         sleep 1  # Brief pause to let user read the warning
     fi
@@ -98,7 +99,7 @@ safe_exec() {
 }
 
 # Add alert message to global accumulator
-# Usage: add_alert "message text" → appends to GLOBAL_ALERTS with newline
+# Usage: add_alert "message text" -> appends to GLOBAL_ALERTS with newline
 add_alert() {
     GLOBAL_ALERTS+="$1"$'\n'
 }
@@ -129,7 +130,7 @@ get_failed_services_details() {
 section_system() {
     local os=$(get_val PRETTY_NAME)
     local host=$(hostname)
-    local kernel=$(uname -r)
+[O    local kernel=$(uname -r)
 
     # Calculate uptime in human-readable format (Xd Xh Xm)
     local up_sec=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
@@ -149,12 +150,12 @@ section_system() {
     # 3. DMI/sysfs checks for specific hypervisors
     # ========================================================================
     local virt="physical"
-    
+
     # Primary: systemd-detect-virt (returns: kvm, vmware, none, etc.)
     if command -v systemd-detect-virt >/dev/null 2>&1; then
         virt=$(systemd-detect-virt 2>/dev/null)
         [[ "$?" -ne 0 || -z "$virt" || "$virt" == "none" ]] && virt="physical"
-    
+
     # Fallback 1: Check CPU flags for hypervisor signatures
     elif grep -iEq "vmware|kvm|qemu|xen|hyperv|virtualbox" /proc/cpuinfo 2>/dev/null; then
         virt="virtual"
@@ -162,11 +163,11 @@ section_system() {
     # OpenVZ: /proc/vz exists but /proc/bc does not (VE vs HA)
     elif [[ -d /proc/vz ]] && [[ ! -d /proc/bc ]]; then
         virt="openvz"
-    
+
     # Hyper-V: DMI sys_vendor check
     elif grep -qi "microsoft corporation" /sys/class/dmi/id/sys_vendor 2>/dev/null; then
         virt="hyperv"
-    
+
     # Xen: hypervisor type check
     elif grep -qi "xen" /sys/hypervisor/type 2>/dev/null; then
         virt="xen"
@@ -179,7 +180,7 @@ section_system() {
     if command -v systemctl >/dev/null 2>&1; then
         # systemd-based systems: list failed units, extract names
         failed_c=$(systemctl list-units --state=failed --no-legend 2>/dev/null | wc -l)
-        # Remove Unicode bullet (●) and extract service names (first 5)
+        # Remove Unicode bullet (bullet) and extract service names (first 5)
         failed_names=$(systemctl list-units --state=failed --no-legend 2>/dev/null | sed 's/●//g' | awk '{print $1}' | head -n 5 | xargs)
     elif command -v rc-status >/dev/null 2>&1; then
         # OpenRC-based systems (Alpine, Gentoo): check for stopped/crashed services
@@ -197,9 +198,8 @@ section_system() {
     pgrep -x "chronyd|ntpd|systemd-timesyncd|ntp" >/dev/null 2>&1 && ntp_active="active"
 
     # Check kernel taint status (non-zero = proprietary modules, OOM, crash, etc.)
-    local taint=$(cat /proc/sys/kernel/tainted 2>/dev/null || echo "0")
+    local taint=$(cat /proc/sys/kernel/tainted 2>/dev/null | grep -oE '[0-9]+' | head -1); taint=${taint:-0}
     if [[ "$taint" != "0" ]]; then
-        [[ "$JSON_MODE" != "true" ]] && echo -e "${Y}⚠ Kernel tainted: code $taint (check dmesg)${NC}"
         add_alert "KERNEL: Tainted (code: $taint)"
     fi
 
@@ -208,7 +208,7 @@ section_system() {
         printf '"system": {"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s", "tainted": %s}' \
             "$(json_escape "$os")" "$(json_escape "$host")" "$(json_escape "$up_pretty")" \
             "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")" "$taint"
-    else
+    elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "${B}=== System Info ===${NC}"
         echo -e "${G}OS:${NC} $os"
         echo -e "${G}Hostname:${NC} $host"
@@ -223,6 +223,7 @@ section_system() {
             get_failed_services_details "$failed_names"
         fi
 
+        [[ "$taint" != "0" ]] && echo -e "${Y}  Kernel tainted: code $taint (check dmesg)${NC}"
         echo -e "${G}NTP service:${NC} $ntp_active"
         echo -e "${G}Current Time:${NC} $(date)"
     fi
@@ -240,9 +241,10 @@ section_cpu() {
     local load=$(cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)
 
     # Calculate CPU usage metrics via /proc/stat sampling
-    # Reads CPU stats, waits 1 second, reads again, calculates deltas
+    # Reads CPU stats, waits CPU_SAMPLE_SEC seconds, reads again, calculates deltas
+    local sample_sec="${CPU_SAMPLE_SEC:-1}"
     local stat1=$(grep '^cpu ' /proc/stat 2>/dev/null)
-    sleep 1
+    sleep "$sample_sec"
     local stat2=$(grep '^cpu ' /proc/stat 2>/dev/null)
 
     # Sum all CPU time fields (user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice)
@@ -288,7 +290,7 @@ section_cpu() {
         # JSON output with escaped strings and all CPU metrics
         printf ', "cpu": {"model": "%s", "cores": %d, "load": "%s", "iowait": %d, "steal": %d, "cpu_usage": %d}' \
             "$(json_escape "$model")" "$cores" "$(json_escape "$load")" "$iowait_f" "$steal_f" "$cpu_usage"
-    else
+    elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== CPU & Load ===${NC}"
         echo -e "${G}Model:${NC} $model"
         echo -e "${G}Cores:${NC} $cores"
@@ -296,15 +298,52 @@ section_cpu() {
         echo -e "${G}I/O Wait:${NC} ${iowait_f}%"
         echo -e "${G}CPU Steal:${NC} ${steal_f}%"
         echo -e "${G}CPU Usage:${NC} ${cpu_usage}%"
-        [[ "$steal_f" -gt 10 ]] && echo -e "${Y}⚠ High steal time may indicate VM resource contention${NC}"
-        [[ "$cpu_usage" -gt 85 ]] && echo -e "${Y}⚠ High CPU usage detected${NC}"
+        [[ "$steal_f" -gt 10 ]] && echo -e "${Y}  High steal time may indicate VM resource contention${NC}"
+        [[ "$cpu_usage" -gt 85 ]] && echo -e "${Y}  High CPU usage detected${NC}"
 
-        # === NEW: Top 3 Processes by CPU and Memory ===
+        # Top 3 Processes by CPU and Memory
         echo -e "\n${B}=== Top Processes ===${NC}"
         echo -e "${G}By CPU:${NC}"
         ps -eo pid,pcpu,comm --sort=-pcpu 2>/dev/null | head -n 4 | tail -n 3 | awk '{printf "    - PID %s: %s%% (%s)\n", $1, $2, $3}'
         echo -e "${G}By Memory:${NC}"
         ps -eo pid,pmem,comm --sort=-pmem 2>/dev/null | head -n 4 | tail -n 3 | awk '{printf "    - PID %s: %s%% (%s)\n", $1, $2, $3}'
+    fi
+}
+
+# ============================================================================
+# SECTION: MEMORY
+# v0.1.2: Extracted into dedicated function with full JSON support.
+# ============================================================================
+section_memory() {
+    # Parse /proc/meminfo for raw kB values - sanitize to digits only
+    local mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); mem_total=${mem_total:-0}
+    local mem_available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); mem_available=${mem_available:-0}
+    local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_total=${swap_total:-0}
+    local swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_free=${swap_free:-0}
+    # Ensure defaults if empty after sanitization
+    mem_total=${mem_total:-0}
+    mem_available=${mem_available:-0}
+    swap_total=${swap_total:-0}
+    swap_free=${swap_free:-0}
+
+    # Convert kB -> MB (integer division)
+    local ram_total_mb=$(( mem_total / 1024 ))
+    local ram_used_mb=$(( (mem_total - mem_available) / 1024 ))
+    local ram_used_pct=0
+    [[ "$mem_total" -gt 0 ]] && ram_used_pct=$(( 100 * (mem_total - mem_available) / mem_total ))
+
+    local swap_total_mb=$(( swap_total / 1024 ))
+    local swap_used_mb=$(( (swap_total - swap_free) / 1024 ))
+    local swap_used_pct=0
+    [[ "$swap_total" -gt 0 ]] && swap_used_pct=$(( 100 * (swap_total - swap_free) / swap_total ))
+
+    if [[ "$JSON_MODE" == "true" ]]; then
+        printf ', "memory": {"ram_total_mb": %d, "ram_used_mb": %d, "ram_used_pct": %d, "swap_total_mb": %d, "swap_used_mb": %d, "swap_used_pct": %d}' \
+            "$ram_total_mb" "$ram_used_mb" "$ram_used_pct" \
+            "$swap_total_mb" "$swap_used_mb" "$swap_used_pct"
+    elif [[ "$QUIET_MODE" != "true" ]]; then
+        echo -e "\n${B}=== Memory ===${NC}"
+        safe_exec 2 free -h 2>/dev/null || safe_exec 2 free 2>/dev/null || echo "  free command unavailable"
     fi
 }
 
@@ -320,9 +359,9 @@ section_storage() {
 
         # Alert on high disk usage via global accumulator
         is_greater "$root_usage" "$THRESHOLD_DISK" && add_alert "DISK SPACE LOW: ${root_usage}%"
-    else
+    elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Storage ===${NC}"
-        echo -e "${G}Mounts:${NC}"
+[I        echo -e "${G}Mounts:${NC}"
         # Use timeout to prevent hang on unresponsive mounts (NFS, slow disks)
         safe_exec 2 df -h 2>/dev/null | grep -E '^/dev/|^/|cs-root' | sed 's/^/  /' || echo "  df command timed out"
 
@@ -331,6 +370,11 @@ section_storage() {
 
         echo -e "${G}Block Devices (lsblk):${NC}"
         safe_exec 2 lsblk -e 7 2>/dev/null | sed 's/^/  /' || echo "  lsblk not available or timed out"
+    else
+        # Quiet mode: still run disk alert checks without printing
+        local root_usage=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
+        root_usage="${root_usage:-0}"
+        is_greater "$root_usage" "$THRESHOLD_DISK" && add_alert "DISK SPACE LOW: ${root_usage}%"
     fi
 }
 
@@ -344,7 +388,7 @@ section_network() {
     if [[ "$JSON_MODE" == "true" ]]; then
         printf ', "network": {"gateway": "%s", "dns": "%s"}' \
             "$(json_escape "${gw:-N/A}")" "$(json_escape "$dns")"
-    else
+    elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Network ===${NC}"
         # Try ip command (modern), fallback to ifconfig (legacy)
         safe_exec 2 ip -4 -br addr 2>/dev/null || safe_exec 2 ifconfig -a 2>/dev/null | grep "inet " | awk '{print $1, $2}'
@@ -425,34 +469,28 @@ section_security() {
         ssh_active_sessions=$(netstat -tnp 2>/dev/null | grep ':22 ' | grep ESTABLISHED | awk '{print $5}' | cut -d: -f1 | sort -u)
     fi
 
-    # 3. ADD TO GLOBAL ALERTS (Fixes missing summary entry)
+    # 3. Add to global alerts
     if [[ "$ssh_total_failures" -gt 0 ]]; then
         local top_ip=$(echo "$ssh_top_ips" | head -1 | awk '{print $2}')
         [[ -n "$top_ip" ]] && add_alert "SSH AUTH FAILURES: ${ssh_total_failures} attempts (Top: $top_ip)"
     fi
 
     # ========================================================================
-    # OUTPUT GENERATION
+    # DANGEROUS PORTS DETECTION
     # ========================================================================
-    if [[ "$JSON_MODE" != "true" ]]; then
-        echo -e "\n${B}=== Security & Updates ===${NC}"
-        echo -e "${G}Firewall:${NC} $fw"
-        echo -e "${G}SSH PermitRootLogin:${NC} $ssh_root"
-        echo -e "${G}SSH Auth Failures:${NC} ${ssh_total_failures} attempts"
+    local regex=":($(echo $DANGER_PORTS_LIST | tr ' ' '|'))([^0-9]|$)"
+    local found=$( (safe_exec 2 ss -tulpn -H 2>/dev/null || safe_exec 2 netstat -tulpn 2>/dev/null) | \
+                   grep -E "$regex" | \
+                   awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) print $i}' | \
+                   sed 's/.*://' | sort -u | xargs)
 
-        if [[ -n "$ssh_top_ips" ]]; then
-            echo -e "${Y}Top Source IPs (Historical):${NC}"
-            echo "$ssh_top_ips" | awk '{printf "    - %-22s (%d attempts)\n", $2, $1}'
-        fi
+    GLOBAL_FOUND_PORTS="$found"
+    [[ -n "$found" ]] && add_alert "SECURITY: Dangerous ports open ($found)"
 
-        echo -e "${G}Active SSH Sessions:${NC}"
-        if [[ -n "$ssh_active_sessions" ]]; then
-            echo "$ssh_active_sessions" | while read -r ip; do [[ -n "$ip" ]] && echo "    - $ip"; done
-        else
-            echo "    None"
-        fi
-    else
-        # JSON output
+    # ========================================================================
+    # OUTPUT GENERATION
+[O    # ========================================================================
+    if [[ "$JSON_MODE" == "true" ]]; then
         local ip_json="["
         if [[ -n "$ssh_top_ips" ]]; then
             local first=true
@@ -479,19 +517,25 @@ section_security() {
 
         printf ', "security": {"firewall": "%s", "ssh_root": "%s", "updates": %d, "ssh_failures": %d, "top_ips": %s, "active_sessions": %s}' \
             "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$upd" "$ssh_total_failures" "$ip_json" "$active_json"
-    fi
 
-    # Dangerous ports detection (unchanged)
-    local regex=":($(echo $DANGER_PORTS_LIST | tr ' ' '|'))([^0-9]|$)"
-    local found=$( (safe_exec 2 ss -tulpn -H 2>/dev/null || safe_exec 2 netstat -tulpn 2>/dev/null) | \
-                   grep -E "$regex" | \
-                   awk '{for(i=1;i<=NF;i++) if($i ~ /:[0-9]+$/) print $i}' | \
-                   sed 's/.*://' | sort -u | xargs)
+    elif [[ "$QUIET_MODE" != "true" ]]; then
+        echo -e "\n${B}=== Security & Updates ===${NC}"
+        echo -e "${G}Firewall:${NC} $fw"
+        echo -e "${G}SSH PermitRootLogin:${NC} $ssh_root"
+        echo -e "${G}SSH Auth Failures:${NC} ${ssh_total_failures} attempts"
 
-    GLOBAL_FOUND_PORTS="$found"
-    [[ -n "$found" ]] && add_alert "SECURITY: Dangerous ports open ($found)"
+        if [[ -n "$ssh_top_ips" ]]; then
+            echo -e "${Y}Top Source IPs (Historical):${NC}"
+            echo "$ssh_top_ips" | awk '{printf "    - %-22s (%d attempts)\n", $2, $1}'
+        fi
 
-    if [[ "$JSON_MODE" != "true" ]]; then
+        echo -e "${G}Active SSH Sessions:${NC}"
+        if [[ -n "$ssh_active_sessions" ]]; then
+            echo "$ssh_active_sessions" | while read -r ip; do [[ -n "$ip" ]] && echo "    - $ip"; done
+        else
+            echo "    None"
+        fi
+
         echo -n -e "${G}Dangerous Ports: ${NC}"
         if [[ -z "$found" ]]; then
             echo -e "${G}None detected${NC}"
@@ -512,9 +556,13 @@ check_health_verdict() {
     is_greater "$root_u" "$THRESHOLD_DISK" && add_alert "Disk space LOW: ${root_u}%"
 
     # Check swap usage (alert if > THRESHOLD_SWAP %)
-    local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
-    local swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null)
-    if [[ -n "$swap_total" && "$swap_total" -gt 0 ]]; then
+    # FIX: same sanitization as in section_memory()
+    local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_total=${swap_total:-0}
+    local swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_free=${swap_free:-0}
+    swap_total=${swap_total:-0}
+    swap_free=${swap_free:-0}
+    
+    if [[ "$swap_total" -gt 0 ]]; then
         local swap_used_pct=$(( 100 * (swap_total - swap_free) / swap_total ))
         [[ "$swap_used_pct" -gt "$THRESHOLD_SWAP" ]] && add_alert "SWAP USAGE: ${swap_used_pct}% (memory pressure)"
     fi
@@ -527,17 +575,38 @@ check_health_verdict() {
         add_alert "Zombie processes detected: $z_count (PIDs: $z_pids)"
     fi
 
+    # ========================================================================
+    # OOM KILL HISTORY (new in v0.1.2)
+    # Scans dmesg ring buffer for Out-of-Memory kill events.
+    # Counts unique OOM events and adds alert if any are found.
+    # Uses 'dmesg -T' for human-readable timestamps when available.
+    # Falls back to plain 'dmesg' on kernels/systems without timestamp support.
+    # ========================================================================
+    local oom_count=0
+    local oom_last=""
+    if command -v dmesg >/dev/null 2>&1; then
+        local dmesg_out=$(safe_exec 3 dmesg 2>/dev/null)
+        # FIX: grep -oE extracts ONLY digits, prevents "0\n0" syntax error
+        oom_count=$(echo "$dmesg_out" | grep -c "Out of memory: Killed process" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        oom_count=${oom_count:-0}
+        if [[ "$oom_count" -gt 0 ]]; then
+            oom_last=$(echo "$dmesg_out" | grep "Out of memory: Killed process" | tail -n1 | sed 's/\[.*\] //')
+            add_alert "OOM KILLS: ${oom_count} event(s) in dmesg (last: $oom_last)"
+        fi
+    fi
+
     if [[ "$JSON_MODE" == "true" ]]; then
         # Determine overall status based on accumulated alerts
         local status="OK"
         [[ -n "$GLOBAL_ALERTS" ]] && status="CRITICAL"
-        printf ', "health": {"status": "%s"}' "$(json_escape "$status")"
+        printf ', "health": {"status": "%s", "oom_kills": %d}' "$(json_escape "$status")" "$oom_count"
         echo "}"  # Close main JSON object
     else
-        echo -e "\n${G}--- Recent Errors (Quick Look) ---${NC}"
-        safe_exec 2 dmesg 2>/dev/null | tail -n 3 | sed 's/^/  /' || echo "  dmesg unavailable"
-
-        echo -e "\n${B}================================================================${NC}"
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            echo -e "\n${G}--- Recent Errors (Quick Look) ---${NC}"
+            safe_exec 2 dmesg 2>/dev/null | tail -n 3 | sed 's/^/  /' || echo "  dmesg unavailable"
+            echo -e "\n${B}================================================================${NC}"
+        fi
 
         if [[ -z "$GLOBAL_ALERTS" ]]; then
             echo -e "System health status: ${G}No critical issues found${NC}"
@@ -547,8 +616,10 @@ check_health_verdict() {
             echo -e "${R}${GLOBAL_ALERTS}${NC}" | sed '/^$/d' | sed 's/^/  /'
         fi
 
-        echo -e "\nReport generated at: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo -e "${B}========================= End of Report =========================${NC}"
+        if [[ "$QUIET_MODE" != "true" ]]; then
+            echo -e "\nReport generated at: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo -e "${B}========================= End of Report =========================${NC}"
+        fi
     fi
 }
 
@@ -557,22 +628,32 @@ check_health_verdict() {
 # ============================================================================
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        -j|--json) JSON_MODE=true ;;      # Enable JSON output mode
-        -l|--log)  SAVE_LOG=true ;;        # Enable logging to file
-        -h|--help)                         # Show help message
+        -j|--json)  JSON_MODE=true ;;     # Enable JSON output mode
+        -l|--log)   SAVE_LOG=true ;;      # Enable logging to file
+        -q|--quiet) QUIET_MODE=true ;;    # Suppress section output; show only health verdict
+        -h|--help)                        # Show help message
             echo "Usage: $0 [OPTIONS]"
+            echo ""
             echo "Options:"
             echo "  -j, --json    Output machine-readable JSON"
             echo "  -l, --log     Save report to timestamped log file"
+            echo "  -q, --quiet   Show only health verdict and alerts (suppress section output)"
             echo "  -h, --help    Show this help message"
             echo ""
             echo "Environment variables:"
             echo "  FAILED_DETAILS_LIMIT=N  Show details for first N failed services (default: 3)"
             echo "  SAFE_TIMEOUT=N          Timeout in seconds for safe_exec wrapper (default: 2)"
             echo "  CPU_SAMPLE_SEC=N        Seconds to sample CPU stats (default: 1)"
+            echo "  THRESHOLD_DISK=N        Disk usage % alert threshold (default: 90)"
+            echo "  THRESHOLD_SWAP=N        Swap usage % alert threshold (default: 50)"
+            echo ""
+            echo "Flag combinations:"
+            echo "  --json --log            JSON output saved to log file"
+            echo "  --quiet --log           Alerts-only output saved to log file"
+            echo "  --json | jq .memory     Parse memory metrics"
             exit 0
             ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;  # Unknown flag → error
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
     shift
 done
@@ -586,7 +667,7 @@ check_root            # Root validation (warning only, non-blocking)
 run_main() {
     if [[ "$JSON_MODE" == "true" ]]; then
         echo -n "{"  # Open main JSON object
-    else
+    elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "${B}================================================================${NC}"
         echo -e "${B}            SYSTEM AUDIT REPORT | $START_TIME_RAW ${NC}"
         echo -e "${B}================================================================${NC}"
@@ -594,20 +675,16 @@ run_main() {
 
     section_system    # OS, hostname, uptime, virtualization, failed services, kernel taint
     section_cpu       # CPU model, cores, load, iowait, steal, usage%, top processes
-
-    # Memory section (text output only, not included in JSON)
-    if [[ "$JSON_MODE" != "true" ]]; then
-        echo -e "\n${B}=== Memory ===${NC}"
-        safe_exec 2 free -h 2>/dev/null || safe_exec 2 free 2>/dev/null || echo "  free command unavailable"
-    fi
-
+    section_memory    # RAM and swap usage (JSON: structured metrics; text: free -h)
     section_storage   # Disk usage, inodes, block devices
     section_network   # Interfaces, gateway, DNS, listening ports
     section_security  # Firewall, SSH config, updates, brute-force attempts, dangerous ports
-    check_health_verdict  # Final status with accumulated alerts (disk, swap, zombies)
+    check_health_verdict  # Final status: disk, swap, zombies, OOM kills + accumulated alerts
 }
 
-# Handle logging or direct output
+# ============================================================================
+# LOGGING & OUTPUT DISPATCH
+# ============================================================================
 if [[ "$SAVE_LOG" == "true" ]]; then
     DEST_LOG="/var/log/$LOG_NAME"
     if ! touch "$DEST_LOG" 2>/dev/null; then
@@ -629,3 +706,15 @@ else
     run_main  # Direct output to stdout
 fi
 
+# ============================================================================
+# EXIT CODE (new in v0.1.2)
+# Exit with code 1 if any critical alerts were accumulated during the run.
+# Enables cron/CI/monitoring integration:
+#   ./healthcheck.sh || send_alert "Server issue detected"
+# JSON mode: jq '.health.status == "CRITICAL"' already handles this,
+# but the exit code makes shell-level checks trivial.
+# ============================================================================
+if [[ -n "$GLOBAL_ALERTS" ]]; then
+    exit 1
+fi
+exit 0
