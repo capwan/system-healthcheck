@@ -130,7 +130,7 @@ get_failed_services_details() {
 section_system() {
     local os=$(get_val PRETTY_NAME)
     local host=$(hostname)
-[O    local kernel=$(uname -r)
+    local kernel=$(uname -r)
 
     # Calculate uptime in human-readable format (Xd Xh Xm)
     local up_sec=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
