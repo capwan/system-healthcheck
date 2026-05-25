@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ============================================================================
-# system-healthcheck v0.1.2 | Release date : 20.05.2026
+# system-healthcheck v0.1.3 | Release date : 25.05.2026
 # Author : Rahman Samadzada (capwan)
 
 # Exit immediately if a pipeline returns non-zero (strict error handling)
@@ -13,9 +13,20 @@ set +m
 # CONFIGURATION & THRESHOLDS
 # ============================================================================
 THRESHOLD_DISK=90                 # Disk usage alert threshold (%)
-THRESHOLD_LOAD=0.9                # Load average threshold (not yet used in alerts)
+THRESHOLD_RAM=85                  # RAM usage alert threshold (%)
+THRESHOLD_LOAD=0.85               # Load per-core alert threshold (load1 / nproc)
 THRESHOLD_SWAP=50                 # Swap usage alert threshold (%)
-DANGER_PORTS_LIST="21 23 161 3389 5900 6379 27017 5432 3306"  # Risky ports to monitor (space-separated)
+THRESHOLD_IOWAIT=40               # I/O Wait alert threshold (%)
+THRESHOLD_UPDATES=20              # Pending updates alert threshold (count)
+THRESHOLD_ENTROPY=200             # Minimum kernel entropy threshold (bits)
+THRESHOLD_SYNRECV=100             # SYN_RECV connections alert threshold (possible SYN flood)
+
+# Risky ports to monitor (space-separated)
+# 21=FTP, 23=Telnet, 111=RPC, 161=SNMP, 445=SMB, 512/513/514=rsh/rlogin/rexec,
+# 1433=MSSQL, 2049=NFS, 2375=Docker(no TLS), 3389=RDP, 4444=Metasploit,
+# 5432=PostgreSQL, 5900=VNC, 5984=CouchDB, 6379=Redis,
+# 9200=Elasticsearch, 11211=Memcached, 27017=MongoDB, 3306=MySQL
+DANGER_PORTS_LIST="21 23 111 161 445 512 513 514 1433 2049 2375 3306 3389 4444 5432 5900 5984 6379 9200 11211 27017"
 
 # ============================================================================
 # STATE VARIABLES
@@ -36,10 +47,10 @@ GLOBAL_FOUND_PORTS=""             # Detected dangerous ports (for cross-section 
 # HELPER FUNCTIONS
 # ============================================================================
 
-# Extract value from /etc/os-release by key name
+# Extract value from /etc/os-release by key name (anchored match)
 # Usage: get_val PRETTY_NAME -> returns "Ubuntu 22.04 LTS" or "N/A"
 get_val() {
-    grep "$1" /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "N/A"
+    grep "^${1}=" /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "N/A"
 }
 
 # Compare two numbers (supports floats via awk)
@@ -65,33 +76,30 @@ check_root() {
     if [[ "$EUID" -ne 0 ]]; then
         echo -e "${Y}Warning: Not running as root. Some data may be incomplete.${NC}" >&2
         echo -e "${Y}  Tip: Use 'sudo $0' for full system access.${NC}" >&2
-        sleep 1  # Brief pause to let user read the warning
+        sleep 1
     fi
 }
 
 # Escape special characters for safe JSON output
 # Handles: backslash, double-quote, newline, tab, carriage return
-# Prevents invalid JSON when values contain special chars (e.g., hostname="test\"host")
 json_escape() {
     local s="$1"
-    s="${s//\\/\\\\}"      # \ -> \\
-    s="${s//\"/\\\"}"      # " -> \"
-    s="${s//$'\n'/\\n}"    # newline -> \n
-    s="${s//$'\t'/\\t}"    # tab -> \t
-    s="${s//$'\r'/\\r}"    # carriage return -> \r
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\r'/\\r}"
     printf '%s' "$s"
 }
 
 # Execute command with timeout to prevent hangs on slow I/O/network
 # Usage: safe_exec <timeout_seconds> <command> [args...]
-# Returns command exit code, or 1 on timeout (exit code 124 from timeout)
 safe_exec() {
     local timeout_sec="$1"
     shift
     timeout "$timeout_sec" "$@" 2>/dev/null
     local exit_code=$?
     if [[ $exit_code -eq 124 ]]; then
-        # 124 = timeout command's exit code for timeout exceeded
         echo "[TIMEOUT: ${*:-command}]" >&2
         return 1
     fi
@@ -99,14 +107,12 @@ safe_exec() {
 }
 
 # Add alert message to global accumulator
-# Usage: add_alert "message text" -> appends to GLOBAL_ALERTS with newline
 add_alert() {
     GLOBAL_ALERTS+="$1"$'\n'
 }
 
 # Get detailed status for failed services (limited to first N to avoid slowdown)
 # Respects FAILED_DETAILS_LIMIT env var (default: 3)
-# Only shows output for systemd-based systems (OpenRC details not implemented)
 get_failed_services_details() {
     local services="$1"
     local count=0
@@ -116,7 +122,6 @@ get_failed_services_details() {
         [[ $count -ge $limit ]] && break
         if command -v systemctl >/dev/null 2>&1; then
             echo "    --- $svc ---"
-            # Use timeout to prevent hang if systemd is unresponsive
             safe_exec 5 systemctl status "$svc" --no-pager -l 2>/dev/null | head -n 8 | sed 's/^/    /'
             echo ""
             ((count++))
@@ -144,31 +149,19 @@ section_system() {
 
     # ========================================================================
     # VIRTUALIZATION DETECTION
-    # Priority order:
-    # 1. systemd-detect-virt (most reliable, covers 90% of cases)
-    # 2. CPU flags for common hypervisors
-    # 3. DMI/sysfs checks for specific hypervisors
+    # Priority: systemd-detect-virt -> CPU flags -> DMI/sysfs
     # ========================================================================
     local virt="physical"
 
-    # Primary: systemd-detect-virt (returns: kvm, vmware, none, etc.)
     if command -v systemd-detect-virt >/dev/null 2>&1; then
         virt=$(systemd-detect-virt 2>/dev/null)
         [[ "$?" -ne 0 || -z "$virt" || "$virt" == "none" ]] && virt="physical"
-
-    # Fallback 1: Check CPU flags for hypervisor signatures
     elif grep -iEq "vmware|kvm|qemu|xen|hyperv|virtualbox" /proc/cpuinfo 2>/dev/null; then
         virt="virtual"
-
-    # OpenVZ: /proc/vz exists but /proc/bc does not (VE vs HA)
     elif [[ -d /proc/vz ]] && [[ ! -d /proc/bc ]]; then
         virt="openvz"
-
-    # Hyper-V: DMI sys_vendor check
     elif grep -qi "microsoft corporation" /sys/class/dmi/id/sys_vendor 2>/dev/null; then
         virt="hyperv"
-
-    # Xen: hypervisor type check
     elif grep -qi "xen" /sys/hypervisor/type 2>/dev/null; then
         virt="xen"
     fi
@@ -178,36 +171,45 @@ section_system() {
     local failed_names=""
 
     if command -v systemctl >/dev/null 2>&1; then
-        # systemd-based systems: list failed units, extract names
         failed_c=$(systemctl list-units --state=failed --no-legend 2>/dev/null | wc -l)
-        # Remove Unicode bullet (bullet) and extract service names (first 5)
         failed_names=$(systemctl list-units --state=failed --no-legend 2>/dev/null | sed 's/●//g' | awk '{print $1}' | head -n 5 | xargs)
     elif command -v rc-status >/dev/null 2>&1; then
-        # OpenRC-based systems (Alpine, Gentoo): check for stopped/crashed services
-        failed_c=$(rc-status --all 2>/dev/null | grep -cE "stopped|crashed" || echo 0)
+        failed_c=$(rc-status --all 2>/dev/null | grep -cE "stopped|crashed" || true)
         failed_names=$(rc-status --all 2>/dev/null | grep -E "stopped|crashed" | awk '{print $1}' | head -n 5 | xargs)
     fi
 
-    # Store in global vars for cross-section access (health verdict, alerts)
     GLOBAL_FAILED_SERVICES="$failed_names"
     GLOBAL_FAILED_COUNT="$failed_c"
     [[ "$failed_c" -gt 0 ]] && add_alert "FAILED SERVICES: $failed_c ($failed_names)"
 
-    # Check NTP service status via process name matching
+    # NTP service status via process name matching
     local ntp_active="inactive"
     pgrep -x "chronyd|ntpd|systemd-timesyncd|ntp" >/dev/null 2>&1 && ntp_active="active"
+    # Alert: NTP inactive means clock drift, invalid TLS certs, broken log correlation
+    [[ "$ntp_active" == "inactive" ]] && add_alert "NTP: Time synchronization inactive (clock drift risk)"
 
-    # Check kernel taint status (non-zero = proprietary modules, OOM, crash, etc.)
+    # Kernel taint status (non-zero = proprietary modules, OOM, crash, etc.)
     local taint=$(cat /proc/sys/kernel/tainted 2>/dev/null | grep -oE '[0-9]+' | head -1); taint=${taint:-0}
-    if [[ "$taint" != "0" ]]; then
-        add_alert "KERNEL: Tainted (code: $taint)"
+    [[ "$taint" != "0" ]] && add_alert "KERNEL: Tainted (code: $taint)"
+
+    # ========================================================================
+    # FILE DESCRIPTOR USAGE
+    # /proc/sys/fs/file-nr: [open] [free-slots] [max]
+    # Alert when open FDs exceed 80% of system maximum
+    # ========================================================================
+    local fd_open=0 fd_max=1 fd_pct=0
+    if [[ -r /proc/sys/fs/file-nr ]]; then
+        fd_open=$(awk '{print $1}' /proc/sys/fs/file-nr 2>/dev/null || echo 0)
+        fd_max=$(awk '{print $3}' /proc/sys/fs/file-nr 2>/dev/null || echo 1)
+        [[ "$fd_max" -gt 0 ]] && fd_pct=$(( 100 * fd_open / fd_max ))
     fi
+    [[ "$fd_pct" -gt 80 ]] && add_alert "FILE DESCRIPTORS: ${fd_pct}% used (${fd_open}/${fd_max})"
 
     if [[ "$JSON_MODE" == "true" ]]; then
-        # JSON output with escaped strings to prevent invalid JSON
-        printf '"system": {"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s", "tainted": %s}' \
+        printf '"system": {"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s", "tainted": %s, "fd_open": %d, "fd_max": %d, "fd_pct": %d}' \
             "$(json_escape "$os")" "$(json_escape "$host")" "$(json_escape "$up_pretty")" \
-            "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")" "$taint"
+            "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")" "$taint" \
+            "$fd_open" "$fd_max" "$fd_pct"
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "${B}=== System Info ===${NC}"
         echo -e "${G}OS:${NC} $os"
@@ -217,7 +219,6 @@ section_system() {
         echo -e "${G}Virt:${NC} $virt"
         echo -e "${G}Failed Services:${NC} $failed_c ${Y}${failed_names}${NC}"
 
-        # Show detailed status for failed services (non-JSON mode only)
         if [[ "$failed_c" -gt 0 && -n "$failed_names" ]]; then
             echo -e "${Y}--- Failed Service Details ---${NC}"
             get_failed_services_details "$failed_names"
@@ -225,6 +226,7 @@ section_system() {
 
         [[ "$taint" != "0" ]] && echo -e "${Y}  Kernel tainted: code $taint (check dmesg)${NC}"
         echo -e "${G}NTP service:${NC} $ntp_active"
+        echo -e "${G}File Descriptors:${NC} ${fd_open}/${fd_max} (${fd_pct}%)"
         echo -e "${G}Current Time:${NC} $(date)"
     fi
 }
@@ -233,75 +235,97 @@ section_system() {
 # SECTION: CPU & LOAD
 # ============================================================================
 section_cpu() {
-    # Get CPU model name, fallback to architecture if not available
     local model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')
     [[ -z "$model" ]] && model=$(uname -m)
 
     local cores=$(nproc 2>/dev/null || echo 1)
     local load=$(cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)
+    local load_1=$(cat /proc/loadavg 2>/dev/null | awk '{print $1}')
 
-    # Calculate CPU usage metrics via /proc/stat sampling
-    # Reads CPU stats, waits CPU_SAMPLE_SEC seconds, reads again, calculates deltas
+    # CPU usage via /proc/stat sampling
     local sample_sec="${CPU_SAMPLE_SEC:-1}"
     local stat1=$(grep '^cpu ' /proc/stat 2>/dev/null)
     sleep "$sample_sec"
     local stat2=$(grep '^cpu ' /proc/stat 2>/dev/null)
 
-    # Sum all CPU time fields (user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice)
-    # Field order: 2=user, 3=nice, 4=system, 5=idle, 6=iowait, 7=irq, 8=softirq, 9=steal, 10=guest, 11=guest_nice
     local tot1=$(echo "$stat1" | awk '{print $2+$3+$4+$5+$6+$7+$8+$9+$10}')
     local tot2=$(echo "$stat2" | awk '{print $2+$3+$4+$5+$6+$7+$8+$9+$10}')
     local diff=$((tot2 - tot1))
 
-    local iowait_f=0
-    local steal_f=0
-    local cpu_usage=0  # Track overall CPU utilization (100 - idle%)
+    local iowait_f=0 steal_f=0 cpu_usage=0
 
     if [[ "$diff" -gt 0 ]]; then
-        # Calculate I/O Wait percentage: field 6 in /proc/stat
         local iowait1=$(echo "$stat1" | awk '{print $6}')
         local iowait2=$(echo "$stat2" | awk '{print $6}')
         iowait_f=$(( 100 * (iowait2 - iowait1) / diff ))
 
-        # Calculate CPU Steal percentage: field 9 in /proc/stat
-        # Crucial for detecting resource contention in VMs (AWS/GCP/VMware)
         local steal1=$(echo "$stat1" | awk '{print $9}')
         local steal2=$(echo "$stat2" | awk '{print $9}')
         steal_f=$(( 100 * (steal2 - steal1) / diff ))
 
-        # === CPU Usage % ===
-        # Idle time is field 5 in /proc/stat
-        # Formula: cpu_usage = 100 - (idle_delta * 100 / total_delta)
         local idle1=$(echo "$stat1" | awk '{print $5}')
         local idle2=$(echo "$stat2" | awk '{print $5}')
         local idle_pct=$(( 100 * (idle2 - idle1) / diff ))
         cpu_usage=$(( 100 - idle_pct ))
-        # Clamp to valid range [0, 100] to handle edge cases
         [[ "$cpu_usage" -lt 0 ]] && cpu_usage=0
         [[ "$cpu_usage" -gt 100 ]] && cpu_usage=100
     fi
 
-    # Alert on high steal time (>10% indicates potential noisy neighbor in virtualized env)
+    # ========================================================================
+    # CPU TEMPERATURE
+    # Reads from /sys/class/thermal (available on physical hosts, some VMs)
+    # Converts millicelsius to celsius. Alerts above 85°C.
+    # Falls back to "N/A" if thermal zones not exposed (common in containers)
+    # ========================================================================
+    local cpu_temp="N/A"
+    local temp_zone="/sys/class/thermal/thermal_zone0/temp"
+    if [[ -r "$temp_zone" ]]; then
+        local raw_temp=$(cat "$temp_zone" 2>/dev/null)
+        if [[ -n "$raw_temp" && "$raw_temp" -gt 0 ]] 2>/dev/null; then
+            cpu_temp=$(( raw_temp / 1000 ))
+            [[ "$cpu_temp" -gt 85 ]] && add_alert "CPU TEMP: ${cpu_temp}°C (thermal throttling risk)"
+        fi
+    fi
+
+    # ========================================================================
+    # LOAD AVERAGE ALERT - normalized by core count
+    # Per-core load > THRESHOLD_LOAD means system is overloaded
+    # Example: load=3.6 on 4 cores -> 0.9 per core -> near saturation
+    # ========================================================================
+    local load_per_core=0
+    if [[ -n "$load_1" && "$cores" -gt 0 ]]; then
+        load_per_core=$(awk -v l="$load_1" -v c="$cores" 'BEGIN{printf "%.2f", l/c}')
+        is_greater "$load_per_core" "$THRESHOLD_LOAD" && \
+            add_alert "HIGH LOAD: ${load_1} (${load_per_core}/core, threshold: ${THRESHOLD_LOAD})"
+    fi
+
+    # Alerts
     [[ "$steal_f" -gt 10 ]] && add_alert "HIGH CPU STEAL: ${steal_f}% (possible VM contention)"
-    # Alert on high CPU usage (>85% may indicate runaway process or crypto miner)
     [[ "$cpu_usage" -gt 85 ]] && add_alert "HIGH CPU USAGE: ${cpu_usage}%"
 
+    # I/O Wait alert (new in v0.1.3)
+    [[ "$iowait_f" -gt "$THRESHOLD_IOWAIT" ]] && \
+        add_alert "HIGH I/O WAIT: ${iowait_f}% (disk bottleneck)"
+
     if [[ "$JSON_MODE" == "true" ]]; then
-        # JSON output with escaped strings and all CPU metrics
-        printf ', "cpu": {"model": "%s", "cores": %d, "load": "%s", "iowait": %d, "steal": %d, "cpu_usage": %d}' \
-            "$(json_escape "$model")" "$cores" "$(json_escape "$load")" "$iowait_f" "$steal_f" "$cpu_usage"
+        printf ', "cpu": {"model": "%s", "cores": %d, "load": "%s", "load_per_core": "%s", "iowait": %d, "steal": %d, "cpu_usage": %d, "temp_celsius": "%s"}' \
+            "$(json_escape "$model")" "$cores" "$(json_escape "$load")" "$load_per_core" \
+            "$iowait_f" "$steal_f" "$cpu_usage" "$cpu_temp"
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== CPU & Load ===${NC}"
         echo -e "${G}Model:${NC} $model"
         echo -e "${G}Cores:${NC} $cores"
-        echo -e "${G}LoadAvg:${NC} $load"
+        echo -e "${G}LoadAvg:${NC} $load  (${load_per_core}/core)"
         echo -e "${G}I/O Wait:${NC} ${iowait_f}%"
         echo -e "${G}CPU Steal:${NC} ${steal_f}%"
         echo -e "${G}CPU Usage:${NC} ${cpu_usage}%"
-        [[ "$steal_f" -gt 10 ]] && echo -e "${Y}  High steal time may indicate VM resource contention${NC}"
-        [[ "$cpu_usage" -gt 85 ]] && echo -e "${Y}  High CPU usage detected${NC}"
+        echo -e "${G}CPU Temp:${NC} ${cpu_temp}$([ "$cpu_temp" != "N/A" ] && echo "°C" || echo "")"
+        [[ "$steal_f" -gt 10 ]]           && echo -e "${Y}  High steal time may indicate VM resource contention${NC}"
+        [[ "$cpu_usage" -gt 85 ]]         && echo -e "${Y}  High CPU usage detected${NC}"
+        [[ "$iowait_f" -gt "$THRESHOLD_IOWAIT" ]] && echo -e "${Y}  High I/O Wait: possible disk bottleneck${NC}"
+        is_greater "$load_per_core" "$THRESHOLD_LOAD" 2>/dev/null && \
+            echo -e "${Y}  Load per core (${load_per_core}) exceeds threshold (${THRESHOLD_LOAD})${NC}"
 
-        # Top 3 Processes by CPU and Memory
         echo -e "\n${B}=== Top Processes ===${NC}"
         echo -e "${G}By CPU:${NC}"
         ps -eo pid,pcpu,comm --sort=-pcpu 2>/dev/null | head -n 4 | tail -n 3 | awk '{printf "    - PID %s: %s%% (%s)\n", $1, $2, $3}'
@@ -312,21 +336,13 @@ section_cpu() {
 
 # ============================================================================
 # SECTION: MEMORY
-# v0.1.2: Extracted into dedicated function with full JSON support.
 # ============================================================================
 section_memory() {
-    # Parse /proc/meminfo for raw kB values - sanitize to digits only
-    local mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); mem_total=${mem_total:-0}
-    local mem_available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); mem_available=${mem_available:-0}
-    local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_total=${swap_total:-0}
-    local swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_free=${swap_free:-0}
-    # Ensure defaults if empty after sanitization
-    mem_total=${mem_total:-0}
-    mem_available=${mem_available:-0}
-    swap_total=${swap_total:-0}
-    swap_free=${swap_free:-0}
+    local mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local mem_available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
 
-    # Convert kB -> MB (integer division)
     local ram_total_mb=$(( mem_total / 1024 ))
     local ram_used_mb=$(( (mem_total - mem_available) / 1024 ))
     local ram_used_pct=0
@@ -337,6 +353,14 @@ section_memory() {
     local swap_used_pct=0
     [[ "$swap_total" -gt 0 ]] && swap_used_pct=$(( 100 * (swap_total - swap_free) / swap_total ))
 
+    # RAM usage alert (new in v0.1.3)
+    [[ "$ram_used_pct" -gt "$THRESHOLD_RAM" ]] && \
+        add_alert "HIGH RAM USAGE: ${ram_used_pct}% (${ram_used_mb}/${ram_total_mb} MB)"
+
+    # Swap alert
+    [[ "$swap_total" -gt 0 && "$swap_used_pct" -gt "$THRESHOLD_SWAP" ]] && \
+        add_alert "SWAP USAGE: ${swap_used_pct}% (memory pressure)"
+
     if [[ "$JSON_MODE" == "true" ]]; then
         printf ', "memory": {"ram_total_mb": %d, "ram_used_mb": %d, "ram_used_pct": %d, "swap_total_mb": %d, "swap_used_mb": %d, "swap_used_pct": %d}' \
             "$ram_total_mb" "$ram_used_mb" "$ram_used_pct" \
@@ -344,6 +368,7 @@ section_memory() {
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Memory ===${NC}"
         safe_exec 2 free -h 2>/dev/null || safe_exec 2 free 2>/dev/null || echo "  free command unavailable"
+        echo -e "${G}RAM Usage:${NC} ${ram_used_pct}% (${ram_used_mb}/${ram_total_mb} MB)"
     fi
 }
 
@@ -351,18 +376,41 @@ section_memory() {
 # SECTION: STORAGE
 # ============================================================================
 section_storage() {
-    if [[ "$JSON_MODE" == "true" ]]; then
-        # Get root filesystem usage percentage (digits only, no % sign)
-        local root_usage=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
-        root_usage="${root_usage:-0}"
-        printf ', "storage": {"root_usage": %d}' "$root_usage"
+    # Disk alert: runs in ALL modes (fixes v0.1.2 double-alert bug)
+    # check_health_verdict no longer re-checks disk
+    local root_usage=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
+    root_usage="${root_usage:-0}"
+    is_greater "$root_usage" "$THRESHOLD_DISK" && add_alert "DISK SPACE LOW: ${root_usage}% on /"
 
-        # Alert on high disk usage via global accumulator
-        is_greater "$root_usage" "$THRESHOLD_DISK" && add_alert "DISK SPACE LOW: ${root_usage}%"
+    # Inode usage alert for all mounted filesystems (new in v0.1.3)
+    if command -v df >/dev/null 2>&1; then
+        while read -r fs iused ifree ipct mp; do
+            local ipct_num="${ipct//%/}"
+            [[ "$ipct_num" =~ ^[0-9]+$ ]] && [[ "$ipct_num" -gt 90 ]] && \
+                add_alert "INODES LOW: ${ipct} on ${mp}"
+        done < <(safe_exec 2 df -i 2>/dev/null | grep -E '^/dev/' | awk '{print $1, $3, $4, $5, $6}')
+    fi
+
+    if [[ "$JSON_MODE" == "true" ]]; then
+        # Build JSON array of all real mount points
+        local mounts_json="["
+        local first_mount=true
+        while read -r line; do
+            local mp=$(echo "$line" | awk '{print $6}')
+            local used_pct=$(echo "$line" | awk '{print $5}' | tr -dc '0-9')
+            local size=$(echo "$line" | awk '{print $2}')
+            local used=$(echo "$line" | awk '{print $3}')
+            [[ -z "$mp" || -z "$used_pct" ]] && continue
+            $first_mount || mounts_json+=","
+            mounts_json+="{\"mount\":\"$(json_escape "$mp")\",\"size_kb\":$size,\"used_kb\":$used,\"used_pct\":${used_pct:-0}}"
+            first_mount=false
+        done < <(safe_exec 2 df -k 2>/dev/null | grep -E '^/dev/')
+        mounts_json+="]"
+        printf ', "storage": {"root_usage": %d, "mounts": %s}' "$root_usage" "$mounts_json"
+
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Storage ===${NC}"
-[I        echo -e "${G}Mounts:${NC}"
-        # Use timeout to prevent hang on unresponsive mounts (NFS, slow disks)
+        echo -e "${G}Mounts:${NC}"
         safe_exec 2 df -h 2>/dev/null | grep -E '^/dev/|^/|cs-root' | sed 's/^/  /' || echo "  df command timed out"
 
         echo -e "${G}Inodes:${NC}"
@@ -370,11 +418,6 @@ section_storage() {
 
         echo -e "${G}Block Devices (lsblk):${NC}"
         safe_exec 2 lsblk -e 7 2>/dev/null | sed 's/^/  /' || echo "  lsblk not available or timed out"
-    else
-        # Quiet mode: still run disk alert checks without printing
-        local root_usage=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
-        root_usage="${root_usage:-0}"
-        is_greater "$root_usage" "$THRESHOLD_DISK" && add_alert "DISK SPACE LOW: ${root_usage}%"
     fi
 }
 
@@ -385,18 +428,77 @@ section_network() {
     local gw=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -n1)
     local dns=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs)
 
+    # ========================================================================
+    # TCP CONNECTION STATES (new in v0.1.3)
+    # ESTABLISHED: active connections (normal load indicator)
+    # SYN_RECV:    half-open connections - spike = possible SYN flood attack
+    # TIME_WAIT:   connections being torn down - high count = past traffic spike
+    # ========================================================================
+    local conn_estab=0 conn_synrecv=0 conn_timewait=0
+
+    if command -v ss >/dev/null 2>&1; then
+        conn_estab=$(ss -tn state established 2>/dev/null | tail -n +2 | wc -l)
+        conn_synrecv=$(ss -tn state syn-recv 2>/dev/null | tail -n +2 | wc -l)
+        conn_timewait=$(ss -tn state time-wait 2>/dev/null | tail -n +2 | wc -l)
+    elif command -v netstat >/dev/null 2>&1; then
+        conn_estab=$(netstat -tn 2>/dev/null | grep -c ESTABLISHED || true)
+        conn_synrecv=$(netstat -tn 2>/dev/null | grep -c SYN_RECV || true)
+        conn_timewait=$(netstat -tn 2>/dev/null | grep -c TIME_WAIT || true)
+    fi
+
+    [[ "$conn_synrecv" -gt "$THRESHOLD_SYNRECV" ]] && \
+        add_alert "NETWORK: ${conn_synrecv} SYN_RECV connections (possible SYN flood)"
+
+    # ========================================================================
+    # NETWORK RX/TX TOTALS (new in v0.1.3)
+    # Reads cumulative bytes from /proc/net/dev since boot.
+    # Shows per-interface totals - useful for identifying primary traffic interface.
+    # No delta/rate: avoids extra sleep, consistent with audit philosophy.
+    # ========================================================================
+    local net_stats=""
+    if [[ -r /proc/net/dev ]]; then
+        net_stats=$(awk 'NR>2 && $1 !~ /^lo:/ {
+            gsub(":", "", $1)
+            if ($2+$10 > 0)
+                printf "    %-12s RX: %s bytes  TX: %s bytes\n", $1, $2, $10
+        }' /proc/net/dev 2>/dev/null)
+    fi
+
     if [[ "$JSON_MODE" == "true" ]]; then
-        printf ', "network": {"gateway": "%s", "dns": "%s"}' \
-            "$(json_escape "${gw:-N/A}")" "$(json_escape "$dns")"
+        # Build interface array from /proc/net/dev
+        local ifaces_json="["
+        local first_iface=true
+        if [[ -r /proc/net/dev ]]; then
+            while read -r iface rx_bytes tx_bytes; do
+                $first_iface || ifaces_json+=","
+                ifaces_json+="{\"iface\":\"$(json_escape "$iface")\",\"rx_bytes\":$rx_bytes,\"tx_bytes\":$tx_bytes}"
+                first_iface=false
+            done < <(awk 'NR>2 && $1 !~ /^lo:/ {gsub(":", "", $1); if ($2+$10>0) print $1, $2, $10}' /proc/net/dev 2>/dev/null)
+        fi
+        ifaces_json+="]"
+
+        printf ', "network": {"gateway": "%s", "dns": "%s", "established": %d, "syn_recv": %d, "time_wait": %d, "interfaces": %s}' \
+            "$(json_escape "${gw:-N/A}")" "$(json_escape "$dns")" \
+            "$conn_estab" "$conn_synrecv" "$conn_timewait" "$ifaces_json"
+
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Network ===${NC}"
-        # Try ip command (modern), fallback to ifconfig (legacy)
-        safe_exec 2 ip -4 -br addr 2>/dev/null || safe_exec 2 ifconfig -a 2>/dev/null | grep "inet " | awk '{print $1, $2}'
+        safe_exec 2 ip -4 -br addr 2>/dev/null || \
+            safe_exec 2 ifconfig -a 2>/dev/null | grep "inet " | awk '{print $1, $2}'
 
         echo -e "${G}Gateway:${NC} ${gw:-N/A}"
         echo -e "${G}DNS:${NC} $dns"
+
+        echo -e "${G}TCP Connections:${NC} ESTABLISHED=${conn_estab}  SYN_RECV=${conn_synrecv}  TIME_WAIT=${conn_timewait}"
+        [[ "$conn_synrecv" -gt "$THRESHOLD_SYNRECV" ]] && \
+            echo -e "${R}  High SYN_RECV count - possible SYN flood attack${NC}"
+
+        if [[ -n "$net_stats" ]]; then
+            echo -e "${G}RX/TX Totals (since boot):${NC}"
+            echo "$net_stats"
+        fi
+
         echo -e "${G}Listening Ports (Top 15):${NC}"
-        # Try ss first (modern, faster), fallback to netstat (legacy, slower)
         (safe_exec 2 ss -tulpn 2>/dev/null || safe_exec 2 netstat -tulpn 2>/dev/null) | head -n 15 | sed 's/^/  /'
     fi
 }
@@ -405,7 +507,7 @@ section_network() {
 # SECTION: SECURITY & UPDATES
 # ============================================================================
 section_security() {
-    # Detect firewall status (firewalld or ufw)
+    # Firewall status
     local fw="OFF"
     if command -v firewall-cmd >/dev/null 2>&1; then
         fw=$(safe_exec 2 firewall-cmd --state 2>/dev/null || echo "OFF")
@@ -413,28 +515,38 @@ section_security() {
         fw=$(safe_exec 2 ufw status 2>/dev/null | head -n1 | awk '{print $2}')
     fi
 
-    # Check SSH root login configuration
+    # ========================================================================
+    # SSH CONFIGURATION CHECKS
+    # ========================================================================
     local ssh_root=$(grep -i "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
     [[ -z "$ssh_root" ]] && ssh_root="prohibit-password"
 
-    # Count pending updates
+    # PasswordAuthentication check (new in v0.1.3)
+    local ssh_pwauth=$(grep -i "^PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+    [[ -z "$ssh_pwauth" ]] && ssh_pwauth="yes"  # OpenSSH default is yes
+    [[ "$ssh_pwauth" == "yes" ]] && add_alert "SSH: PasswordAuthentication is enabled (key-only recommended)"
+
+    # ========================================================================
+    # PENDING UPDATES (expanded: APK for Alpine added in v0.1.3)
+    # ========================================================================
     local upd=0
     if command -v dnf >/dev/null 2>&1; then
         upd=$(safe_exec 10 dnf check-update -q 2>/dev/null | grep -v "^$" | wc -l)
     elif command -v apt-get >/dev/null 2>&1; then
         upd=$(safe_exec 10 apt-get -s upgrade 2>/dev/null | grep -Po '^\d+(?= upgraded)')
+    elif command -v apk >/dev/null 2>&1; then
+        upd=$(safe_exec 10 apk list --upgradable 2>/dev/null | wc -l)
     fi
     upd=$(echo "$upd" | tr -dc '0-9')
     upd=${upd:-0}
+    [[ "$upd" -gt "$THRESHOLD_UPDATES" ]] && \
+        add_alert "UPDATES: ${upd} pending packages (threshold: ${THRESHOLD_UPDATES})"
 
     # ========================================================================
-    # SSH SECURITY: Historical Failures + Active Sessions + Alert
+    # SSH SECURITY: Historical Failures + Active Sessions
     # ========================================================================
-    local ssh_total_failures=0
-    local ssh_top_ips=""
-    local ssh_active_sessions=""
+    local ssh_total_failures=0 ssh_top_ips="" ssh_active_sessions=""
 
-    # 1. Historical failed attempts (lastb -> text logs fallback)
     if command -v lastb >/dev/null 2>&1; then
         ssh_top_ips=$(lastb 2>/dev/null | awk '{print $3}' | \
                       grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9a-fA-F:]{7,}$' | \
@@ -458,18 +570,14 @@ section_security() {
         fi
     fi
 
-    if [[ -n "$ssh_top_ips" ]]; then
-        ssh_total_failures=$(echo "$ssh_top_ips" | awk '{sum+=$1} END {print sum+0}')
-    fi
+    [[ -n "$ssh_top_ips" ]] && ssh_total_failures=$(echo "$ssh_top_ips" | awk '{sum+=$1} END {print sum+0}')
 
-    # 2. Active SSH sessions (ESTABLISHED on port 22)
     if command -v ss >/dev/null 2>&1; then
         ssh_active_sessions=$(ss -tnp 2>/dev/null | grep ':22 ' | grep ESTAB | awk '{print $5}' | cut -d: -f1 | sort -u)
     elif command -v netstat >/dev/null 2>&1; then
         ssh_active_sessions=$(netstat -tnp 2>/dev/null | grep ':22 ' | grep ESTABLISHED | awk '{print $5}' | cut -d: -f1 | sort -u)
     fi
 
-    # 3. Add to global alerts
     if [[ "$ssh_total_failures" -gt 0 ]]; then
         local top_ip=$(echo "$ssh_top_ips" | head -1 | awk '{print $2}')
         [[ -n "$top_ip" ]] && add_alert "SSH AUTH FAILURES: ${ssh_total_failures} attempts (Top: $top_ip)"
@@ -488,8 +596,75 @@ section_security() {
     [[ -n "$found" ]] && add_alert "SECURITY: Dangerous ports open ($found)"
 
     # ========================================================================
-    # OUTPUT GENERATION
-[O    # ========================================================================
+    # USER & PRIVILEGE CHECKS (new in v0.1.3)
+    # ========================================================================
+
+    # UID=0 accounts other than root (backdoor indicator)
+    local uid0_extra=""
+    uid0_extra=$(awk -F: '$3==0 && $1!="root" {print $1}' /etc/passwd 2>/dev/null | xargs)
+    [[ -n "$uid0_extra" ]] && add_alert "SECURITY: Extra UID=0 accounts detected: $uid0_extra"
+
+    # Empty or locked-blank passwords (needs root for /etc/shadow)
+    local empty_pwd=""
+    if [[ -r /etc/shadow ]]; then
+        empty_pwd=$(awk -F: '($2=="" || $2=="!") {print $1}' /etc/shadow 2>/dev/null | xargs)
+        [[ -n "$empty_pwd" ]] && add_alert "SECURITY: Accounts with empty/no password: $empty_pwd"
+    fi
+
+    # sudo/wheel group members
+    local sudo_members=""
+    sudo_members=$(getent group sudo wheel 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | sort -u | xargs)
+
+    # Last 5 logins
+    local last_logins=""
+    last_logins=$(last -n 5 2>/dev/null | head -n 5 | grep -v "^$\|^wtmp" || echo "N/A")
+
+    # ========================================================================
+    # KERNEL SECURITY PARAMETERS (new in v0.1.3)
+    # ========================================================================
+
+    # ASLR: Address Space Layout Randomization
+    # 0=disabled (bad), 1=conservative, 2=full (recommended)
+    local aslr=$(cat /proc/sys/kernel/randomize_va_space 2>/dev/null || echo "N/A")
+    [[ "$aslr" == "0" ]] && add_alert "SECURITY: ASLR disabled (/proc/sys/kernel/randomize_va_space=0)"
+
+    # Kernel entropy: low entropy weakens cryptographic operations
+    local entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null || echo "N/A")
+    if [[ "$entropy" =~ ^[0-9]+$ ]] && [[ "$entropy" -lt "$THRESHOLD_ENTROPY" ]]; then
+        add_alert "SECURITY: Low kernel entropy: ${entropy} bits (threshold: ${THRESHOLD_ENTROPY})"
+    fi
+
+    # /tmp noexec check: /tmp should not be executable
+    local tmp_noexec="yes"
+    if grep -q ' /tmp ' /proc/mounts 2>/dev/null; then
+        grep ' /tmp ' /proc/mounts 2>/dev/null | grep -q noexec || tmp_noexec="no"
+        [[ "$tmp_noexec" == "no" ]] && add_alert "SECURITY: /tmp mounted without noexec (hardening gap)"
+    fi
+
+    # SELinux status (via /sys/fs/selinux or sestatus fallback)
+    local selinux_status="N/A"
+    if [[ -r /sys/fs/selinux/enforce ]]; then
+        local enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)
+        [[ "$enforce" == "1" ]] && selinux_status="enforcing"
+        [[ "$enforce" == "0" ]] && selinux_status="permissive"
+    elif [[ -d /sys/fs/selinux ]]; then
+        selinux_status="enabled"
+    else
+        selinux_status="disabled/N/A"
+    fi
+
+    # AppArmor status (via /sys/kernel/security/apparmor)
+    local apparmor_status="N/A"
+    if [[ -d /sys/kernel/security/apparmor ]]; then
+        local aa_profiles=$(cat /sys/kernel/security/apparmor/profiles 2>/dev/null | wc -l)
+        apparmor_status="active (${aa_profiles} profiles)"
+    else
+        apparmor_status="disabled/N/A"
+    fi
+
+    # ========================================================================
+    # OUTPUT
+    # ========================================================================
     if [[ "$JSON_MODE" == "true" ]]; then
         local ip_json="["
         if [[ -n "$ssh_top_ips" ]]; then
@@ -515,13 +690,19 @@ section_security() {
         fi
         active_json+="]"
 
-        printf ', "security": {"firewall": "%s", "ssh_root": "%s", "updates": %d, "ssh_failures": %d, "top_ips": %s, "active_sessions": %s}' \
-            "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$upd" "$ssh_total_failures" "$ip_json" "$active_json"
+        printf ', "security": {"firewall": "%s", "ssh_root": "%s", "ssh_pwauth": "%s", "updates": %d, "ssh_failures": %d, "top_ips": %s, "active_sessions": %s, "uid0_extra": "%s", "aslr": "%s", "entropy": "%s", "tmp_noexec": "%s", "selinux": "%s", "apparmor": "%s"}' \
+            "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$(json_escape "$ssh_pwauth")" \
+            "$upd" "$ssh_total_failures" "$ip_json" "$active_json" \
+            "$(json_escape "$uid0_extra")" "$(json_escape "$aslr")" "$(json_escape "$entropy")" \
+            "$(json_escape "$tmp_noexec")" "$(json_escape "$selinux_status")" "$(json_escape "$apparmor_status")"
 
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Security & Updates ===${NC}"
         echo -e "${G}Firewall:${NC} $fw"
+
+        echo -e "\n${G}--- SSH Configuration ---${NC}"
         echo -e "${G}SSH PermitRootLogin:${NC} $ssh_root"
+        echo -e "${G}SSH PasswordAuthentication:${NC} $ssh_pwauth"
         echo -e "${G}SSH Auth Failures:${NC} ${ssh_total_failures} attempts"
 
         if [[ -n "$ssh_top_ips" ]]; then
@@ -536,6 +717,22 @@ section_security() {
             echo "    None"
         fi
 
+        echo -e "\n${G}--- User & Privilege Audit ---${NC}"
+        echo -e "${G}Extra UID=0 accounts:${NC} ${uid0_extra:-none}"
+        echo -e "${G}Empty passwords:${NC} ${empty_pwd:-none (or /etc/shadow unreadable)}"
+        echo -e "${G}sudo/wheel members:${NC} ${sudo_members:-none detected}"
+
+        echo -e "\n${G}--- Recent Logins ---${NC}"
+        echo "$last_logins" | sed 's/^/  /'
+
+        echo -e "\n${G}--- Kernel Security ---${NC}"
+        echo -e "${G}ASLR:${NC} $aslr $([ "$aslr" == "0" ] && echo -e "${R}(DISABLED - risk)${NC}" || echo -e "${G}(OK)${NC}")"
+        echo -e "${G}Entropy:${NC} ${entropy} bits $([ "$entropy" != "N/A" ] && [ "$entropy" -lt "$THRESHOLD_ENTROPY" ] 2>/dev/null && echo -e "${Y}(LOW)${NC}" || echo "")"
+        echo -e "${G}/tmp noexec:${NC} $tmp_noexec"
+        echo -e "${G}SELinux:${NC} $selinux_status"
+        echo -e "${G}AppArmor:${NC} $apparmor_status"
+
+        echo -e "\n${G}--- Ports & Updates ---${NC}"
         echo -n -e "${G}Dangerous Ports: ${NC}"
         if [[ -z "$found" ]]; then
             echo -e "${G}None detected${NC}"
@@ -550,43 +747,20 @@ section_security() {
 # SECTION: HEALTH VERDICT & FINAL REPORT
 # ============================================================================
 check_health_verdict() {
-    # Check disk usage on root filesystem
-    local root_u=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
-    root_u="${root_u:-0}"
-    is_greater "$root_u" "$THRESHOLD_DISK" && add_alert "Disk space LOW: ${root_u}%"
+    # NOTE: Disk check removed from here (was duplicate with section_storage)
+    # Disk alert is now always added inside section_storage() regardless of mode
 
-    # Check swap usage (alert if > THRESHOLD_SWAP %)
-    # FIX: same sanitization as in section_memory()
-    local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_total=${swap_total:-0}
-    local swap_free=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null | grep -oE '[0-9]+' | head -1); swap_free=${swap_free:-0}
-    swap_total=${swap_total:-0}
-    swap_free=${swap_free:-0}
-    
-    if [[ "$swap_total" -gt 0 ]]; then
-        local swap_used_pct=$(( 100 * (swap_total - swap_free) / swap_total ))
-        [[ "$swap_used_pct" -gt "$THRESHOLD_SWAP" ]] && add_alert "SWAP USAGE: ${swap_used_pct}% (memory pressure)"
-    fi
-
-    # Detect zombie processes with PID output
-    # ps -o pid,stat: filter rows where STAT column starts with 'Z'
+    # Zombie processes
     local z_pids=$(ps -o pid,stat 2>/dev/null | awk '$2 ~ /^Z/ {print $1}' | xargs)
     if [[ -n "$z_pids" ]]; then
         local z_count=$(echo "$z_pids" | wc -w)
         add_alert "Zombie processes detected: $z_count (PIDs: $z_pids)"
     fi
 
-    # ========================================================================
-    # OOM KILL HISTORY (new in v0.1.2)
-    # Scans dmesg ring buffer for Out-of-Memory kill events.
-    # Counts unique OOM events and adds alert if any are found.
-    # Uses 'dmesg -T' for human-readable timestamps when available.
-    # Falls back to plain 'dmesg' on kernels/systems without timestamp support.
-    # ========================================================================
-    local oom_count=0
-    local oom_last=""
+    # OOM Kill history (from v0.1.2)
+    local oom_count=0 oom_last=""
     if command -v dmesg >/dev/null 2>&1; then
         local dmesg_out=$(safe_exec 3 dmesg 2>/dev/null)
-        # FIX: grep -oE extracts ONLY digits, prevents "0\n0" syntax error
         oom_count=$(echo "$dmesg_out" | grep -c "Out of memory: Killed process" 2>/dev/null | grep -oE '[0-9]+' | head -1)
         oom_count=${oom_count:-0}
         if [[ "$oom_count" -gt 0 ]]; then
@@ -595,16 +769,34 @@ check_health_verdict() {
         fi
     fi
 
+    # ========================================================================
+    # DMESG ERROR COUNT (new in v0.1.3)
+    # Counts kernel messages at error level or above (err, crit, alert, emerg)
+    # Uses --level flag (available on modern kernels/util-linux)
+    # Falls back to grep on "error|warning" keywords for older systems
+    # ========================================================================
+    local dmesg_errors=0
+    if command -v dmesg >/dev/null 2>&1; then
+        dmesg_errors=$(safe_exec 3 dmesg --level=err,crit,alert,emerg 2>/dev/null | wc -l)
+        if [[ "$?" -ne 0 || "$dmesg_errors" -eq 0 ]]; then
+            # Fallback: grep keyword approach for older util-linux
+            dmesg_errors=$(safe_exec 3 dmesg 2>/dev/null | grep -ciE '\berr(or)?\b|\bcrit(ical)?\b|\bpanic\b' || true)
+        fi
+        dmesg_errors="${dmesg_errors:-0}"
+        [[ "$dmesg_errors" -gt 10 ]] && add_alert "DMESG: ${dmesg_errors} kernel error messages (check dmesg)"
+    fi
+
     if [[ "$JSON_MODE" == "true" ]]; then
-        # Determine overall status based on accumulated alerts
         local status="OK"
         [[ -n "$GLOBAL_ALERTS" ]] && status="CRITICAL"
-        printf ', "health": {"status": "%s", "oom_kills": %d}' "$(json_escape "$status")" "$oom_count"
-        echo "}"  # Close main JSON object
+        printf ', "health": {"status": "%s", "oom_kills": %d, "dmesg_errors": %d}' \
+            "$(json_escape "$status")" "$oom_count" "$dmesg_errors"
+        echo "}"
     else
         if [[ "$QUIET_MODE" != "true" ]]; then
-            echo -e "\n${G}--- Recent Errors (Quick Look) ---${NC}"
+            echo -e "\n${G}--- Recent Kernel Messages ---${NC}"
             safe_exec 2 dmesg 2>/dev/null | tail -n 3 | sed 's/^/  /' || echo "  dmesg unavailable"
+            [[ "$dmesg_errors" -gt 0 ]] && echo -e "${Y}  Total kernel error-level messages: ${dmesg_errors}${NC}"
             echo -e "\n${B}================================================================${NC}"
         fi
 
@@ -612,7 +804,6 @@ check_health_verdict() {
             echo -e "System health status: ${G}No critical issues found${NC}"
         else
             echo -e "System health status: ${R}CRITICAL ISSUES DETECTED${NC}"
-            # Output accumulated alerts, remove empty lines, indent for readability
             echo -e "${R}${GLOBAL_ALERTS}${NC}" | sed '/^$/d' | sed 's/^/  /'
         fi
 
@@ -628,29 +819,47 @@ check_health_verdict() {
 # ============================================================================
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        -j|--json)  JSON_MODE=true ;;     # Enable JSON output mode
-        -l|--log)   SAVE_LOG=true ;;      # Enable logging to file
-        -q|--quiet) QUIET_MODE=true ;;    # Suppress section output; show only health verdict
-        -h|--help)                        # Show help message
+        -j|--json)    JSON_MODE=true ;;
+        -l|--log)     SAVE_LOG=true ;;
+        -q|--quiet)   QUIET_MODE=true ;;
+        -v|--version)
+            echo "system-healthcheck v0.1.3"
+            exit 0
+            ;;
+        -h|--help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  -j, --json    Output machine-readable JSON"
-            echo "  -l, --log     Save report to timestamped log file"
-            echo "  -q, --quiet   Show only health verdict and alerts (suppress section output)"
-            echo "  -h, --help    Show this help message"
+            echo "  -j, --json      Output machine-readable JSON"
+            echo "  -l, --log       Save report to timestamped log file"
+            echo "  -q, --quiet     Show only health verdict and alerts (suppress section output)"
+            echo "  -v, --version   Show version and exit"
+            echo "  -h, --help      Show this help message"
             echo ""
             echo "Environment variables:"
-            echo "  FAILED_DETAILS_LIMIT=N  Show details for first N failed services (default: 3)"
-            echo "  SAFE_TIMEOUT=N          Timeout in seconds for safe_exec wrapper (default: 2)"
-            echo "  CPU_SAMPLE_SEC=N        Seconds to sample CPU stats (default: 1)"
-            echo "  THRESHOLD_DISK=N        Disk usage % alert threshold (default: 90)"
-            echo "  THRESHOLD_SWAP=N        Swap usage % alert threshold (default: 50)"
+            echo "  FAILED_DETAILS_LIMIT=N   Show details for first N failed services (default: 3)"
+            echo "  SAFE_TIMEOUT=N           Timeout in seconds for safe_exec wrapper (default: 2)"
+            echo "  CPU_SAMPLE_SEC=N         Seconds to sample CPU stats (default: 1)"
+            echo "  THRESHOLD_DISK=N         Disk usage % alert threshold (default: 90)"
+            echo "  THRESHOLD_RAM=N          RAM usage % alert threshold (default: 85)"
+            echo "  THRESHOLD_SWAP=N         Swap usage % alert threshold (default: 50)"
+            echo "  THRESHOLD_IOWAIT=N       I/O Wait % alert threshold (default: 40)"
+            echo "  THRESHOLD_LOAD=N         Per-core load alert threshold (default: 0.85)"
+            echo "  THRESHOLD_UPDATES=N      Pending updates alert threshold (default: 20)"
+            echo "  THRESHOLD_ENTROPY=N      Min kernel entropy bits threshold (default: 200)"
+            echo "  THRESHOLD_SYNRECV=N      SYN_RECV connections alert threshold (default: 100)"
             echo ""
             echo "Flag combinations:"
-            echo "  --json --log            JSON output saved to log file"
-            echo "  --quiet --log           Alerts-only output saved to log file"
-            echo "  --json | jq .memory     Parse memory metrics"
+            echo "  --json --log             JSON output saved to log file"
+            echo "  --quiet --log            Alerts-only output saved to log file"
+            echo "  --json | jq .memory      Parse memory metrics"
+            echo "  --json | jq .security    Parse security metrics"
+            echo ""
+            echo "Cron examples:"
+            echo "  # Alert on any issue (exit code 1 = problems found)"
+            echo "  ./healthcheck.sh --quiet || mail -s 'Server Alert' admin@example.com"
+            echo "  # Hourly silent audit log"
+            echo "  0 * * * * /usr/local/bin/healthcheck.sh --quiet --log >/dev/null 2>&1"
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -661,25 +870,25 @@ done
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
-setup_colors          # Initialize color codes based on JSON_MODE
-check_root            # Root validation (warning only, non-blocking)
+setup_colors
+check_root
 
 run_main() {
     if [[ "$JSON_MODE" == "true" ]]; then
-        echo -n "{"  # Open main JSON object
+        echo -n "{"
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "${B}================================================================${NC}"
         echo -e "${B}            SYSTEM AUDIT REPORT | $START_TIME_RAW ${NC}"
         echo -e "${B}================================================================${NC}"
     fi
 
-    section_system    # OS, hostname, uptime, virtualization, failed services, kernel taint
-    section_cpu       # CPU model, cores, load, iowait, steal, usage%, top processes
-    section_memory    # RAM and swap usage (JSON: structured metrics; text: free -h)
-    section_storage   # Disk usage, inodes, block devices
-    section_network   # Interfaces, gateway, DNS, listening ports
-    section_security  # Firewall, SSH config, updates, brute-force attempts, dangerous ports
-    check_health_verdict  # Final status: disk, swap, zombies, OOM kills + accumulated alerts
+    section_system       # OS, hostname, uptime, virt, failed services, NTP, kernel taint, FD usage
+    section_cpu          # CPU model, cores, load (normalized), iowait, steal, usage%, temp, top procs
+    section_memory       # RAM/swap usage with alert thresholds
+    section_storage      # Disk/inode usage for all mounts + alerts
+    section_network      # Interfaces, gateway, DNS, TCP states, RX/TX totals, listening ports
+    section_security     # Firewall, SSH config, updates, brute-force, ports, user audit, kernel hardening
+    check_health_verdict # Final status: zombies, OOM kills, dmesg errors + all accumulated alerts
 }
 
 # ============================================================================
@@ -688,31 +897,24 @@ run_main() {
 if [[ "$SAVE_LOG" == "true" ]]; then
     DEST_LOG="/var/log/$LOG_NAME"
     if ! touch "$DEST_LOG" 2>/dev/null; then
-        # Fallback to current directory if /var/log is not writable
         DEST_LOG="./$LOG_NAME"
     fi
 
     if [[ "$JSON_MODE" == "true" ]]; then
-        # JSON: just tee to file (no colors anyway)
         run_main | tee "$DEST_LOG"
     else
-        # Text mode: show colored output on screen, write clean output to log
-        # Process substitution: tee sends to both stdout and sed (which strips ANSI codes)
         run_main | tee >(sed 's/\x1b\[[0-9;]*m//g' > "$DEST_LOG")
     fi
 
     [[ "$JSON_MODE" != "true" ]] && echo -e "\n${Y}Log file created: ${DEST_LOG}${NC}"
 else
-    run_main  # Direct output to stdout
+    run_main
 fi
 
 # ============================================================================
-# EXIT CODE (new in v0.1.2)
-# Exit with code 1 if any critical alerts were accumulated during the run.
-# Enables cron/CI/monitoring integration:
-#   ./healthcheck.sh || send_alert "Server issue detected"
-# JSON mode: jq '.health.status == "CRITICAL"' already handles this,
-# but the exit code makes shell-level checks trivial.
+# EXIT CODE
+# Exit 1 if any critical alerts accumulated; exit 0 if system is clean.
+# Enables: ./healthcheck.sh --quiet || send_alert
 # ============================================================================
 if [[ -n "$GLOBAL_ALERTS" ]]; then
     exit 1
