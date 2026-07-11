@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ============================================================================
-# system-healthcheck v0.1.3 | Release date : 25.05.2026
+# system-healthcheck v0.1.4 | Release date : 11.07.2026
 # Author : Rahman Samadzada (capwan)
 
 # Exit immediately if a pipeline returns non-zero (strict error handling)
@@ -16,6 +16,7 @@ THRESHOLD_DISK=90                 # Disk usage alert threshold (%)
 THRESHOLD_RAM=85                  # RAM usage alert threshold (%)
 THRESHOLD_LOAD=0.85               # Load per-core alert threshold (load1 / nproc)
 THRESHOLD_SWAP=50                 # Swap usage alert threshold (%)
+THRESHOLD_INODE=90                # Inode usage alert threshold (%)
 THRESHOLD_IOWAIT=40               # I/O Wait alert threshold (%)
 THRESHOLD_UPDATES=20              # Pending updates alert threshold (count)
 THRESHOLD_ENTROPY=200             # Minimum kernel entropy threshold (bits)
@@ -386,7 +387,7 @@ section_storage() {
     if command -v df >/dev/null 2>&1; then
         while read -r fs iused ifree ipct mp; do
             local ipct_num="${ipct//%/}"
-            [[ "$ipct_num" =~ ^[0-9]+$ ]] && [[ "$ipct_num" -gt 90 ]] && \
+            [[ "$ipct_num" =~ ^[0-9]+$ ]] && [[ "$ipct_num" -gt "$THRESHOLD_INODE" ]] && \
                 add_alert "INODES LOW: ${ipct} on ${mp}"
         done < <(safe_exec 2 df -i 2>/dev/null | grep -E '^/dev/' | awk '{print $1, $3, $4, $5, $6}')
     fi
@@ -726,7 +727,14 @@ section_security() {
         echo "$last_logins" | sed 's/^/  /'
 
         echo -e "\n${G}--- Kernel Security ---${NC}"
-        echo -e "${G}ASLR:${NC} $aslr $([ "$aslr" == "0" ] && echo -e "${R}(DISABLED - risk)${NC}" || echo -e "${G}(OK)${NC}")"
+        echo -e "${G}ASLR:${NC} $aslr $(
+        case "$aslr" in
+            0) echo -e "${R}(DISABLED - risk)${NC}" ;;
+            1) echo -e "${Y}(conservative)${NC}" ;;
+            2) echo -e "${G}(full protection)${NC}" ;;
+            *) echo "" ;;
+        esac
+        )"
         echo -e "${G}Entropy:${NC} ${entropy} bits $([ "$entropy" != "N/A" ] && [ "$entropy" -lt "$THRESHOLD_ENTROPY" ] 2>/dev/null && echo -e "${Y}(LOW)${NC}" || echo "")"
         echo -e "${G}/tmp noexec:${NC} $tmp_noexec"
         echo -e "${G}SELinux:${NC} $selinux_status"
@@ -823,7 +831,7 @@ while [ "$#" -gt 0 ]; do
         -l|--log)     SAVE_LOG=true ;;
         -q|--quiet)   QUIET_MODE=true ;;
         -v|--version)
-            echo "system-healthcheck v0.1.3"
+            echo "system-healthcheck v0.1.4"
             exit 0
             ;;
         -h|--help)
@@ -845,6 +853,7 @@ while [ "$#" -gt 0 ]; do
             echo "  THRESHOLD_SWAP=N         Swap usage % alert threshold (default: 50)"
             echo "  THRESHOLD_IOWAIT=N       I/O Wait % alert threshold (default: 40)"
             echo "  THRESHOLD_LOAD=N         Per-core load alert threshold (default: 0.85)"
+            echo "  THRESHOLD_INODE=N        Inode usage % alert threshold (default: 90)"
             echo "  THRESHOLD_UPDATES=N      Pending updates alert threshold (default: 20)"
             echo "  THRESHOLD_ENTROPY=N      Min kernel entropy bits threshold (default: 200)"
             echo "  THRESHOLD_SYNRECV=N      SYN_RECV connections alert threshold (default: 100)"
@@ -854,6 +863,12 @@ while [ "$#" -gt 0 ]; do
             echo "  --quiet --log            Alerts-only output saved to log file"
             echo "  --json | jq .memory      Parse memory metrics"
             echo "  --json | jq .security    Parse security metrics"
+            echo ""
+            echo "JSON parsing examples (requires jq):"
+            echo "  ./healthcheck.sh --json | jq '.cpu.cpu_usage'          # Get CPU usage %"
+            echo "  ./healthcheck.sh --json | jq '.health.status'          # Get health status"
+            echo "  ./healthcheck.sh --json | jq '.security.ssh_failures'  # Get SSH failure count"
+            echo "  ./healthcheck.sh --json | jq 'if .health.status == \"CRITICAL\" then 1 else 0 end'  # Exit code for automation"
             echo ""
             echo "Cron examples:"
             echo "  # Alert on any issue (exit code 1 = problems found)"
