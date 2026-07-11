@@ -192,10 +192,10 @@ THRESHOLD_SYNRECV=200 THRESHOLD_ENTROPY=256 THRESHOLD_LOAD=1.0 ./healthcheck.sh
 |----------|---------|---------|
 | `THRESHOLD_DISK` | `90` | Disk usage % that triggers alert 
 | `THRESHOLD_SWAP` | `50` | Swap usage % that triggers memory pressure alert 
-| `THRESHOLD_INODE` | `90` | Inode usage % that triggers alert on any mounted filesystem 
 | `THRESHOLD_RAM` | `85` | RAM usage % that triggers alert 
 | `THRESHOLD_IOWAIT` | `40` | I/O Wait % that triggers alert 
 | `THRESHOLD_LOAD` | `0.85` | Per-core load average threshold
+| `THRESHOLD_INODE` | `90` | Inode usage % that triggers alert on any mounted filesystem 
 | `THRESHOLD_SYNRECV` | `100` | SYN_RECV count that triggers possible flood alert
 | `THRESHOLD_ENTROPY` | `200` | Minimum available entropy (bits) before alert
 | `THRESHOLD_UPDATES` | `20` | Pending update count that triggers alert
