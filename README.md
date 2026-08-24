@@ -1,4 +1,4 @@
-# system-healthcheck (`v0.1.4`)
+# system-healthcheck (`v0.1.5`)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.0+-blue.svg)](https://www.gnu.org/software/bash/)
@@ -10,24 +10,26 @@ A lightweight, high-performance Bash script for rapid server audits and health m
 
 ## 🔄 Changelog
 
-### v0.1.4 (Current)
+### v0.1.5 (Current) 
 
 #### ✨ New Features
-- **Inode Usage Alerts**: New `THRESHOLD_INODE` environment variable to monitor inode exhaustion on mounted filesystems (default: 90%)
-- **JSON Parsing Examples**: Added practical `jq` examples in `--help` for extracting metrics from JSON output
+- **`--no-color` flag**: Disable ANSI color codes for clean logs, CI/CD pipelines, or terminals without color support. Fully supports `NO_COLOR=1` environment variable.
+- **`--section NAME` mode**: Run only a specific audit section (`system`, `cpu`, `memory`, `storage`, `network`, `security`) for faster, targeted diagnostics.
+- **JSON version field**: Added `"version": "v0.1.5"` to JSON output root for easy script version tracking in automation pipelines.
 
 #### 🔧 Improvements
+- **Section-mode JSON consistency**: Ensured valid JSON output when combining `--section` and `--json` flags.
+- **Enhanced `--help`**: Added practical examples for `--section`, `--no-color`, and JSON version parsing (`jq '.version'`).
+
+---
+
+### v0.1.4 (Previous Release)
+
+- **Inode Usage Alerts**: New `THRESHOLD_INODE` environment variable to monitor inode exhaustion on mounted filesystems (default: 90%)
+- **JSON Parsing Examples**: Added practical `jq` examples in `--help` for extracting metrics from JSON output
 - **Entropy Alert Robustness**: Fixed validation logic to prevent false positives when `/proc/sys/kernel/random/entropy_avail` returns non-numeric values
 - **Firewall Output Consistency**: Ensured single-line output for firewall status across all distributions
 - **Version String Update**: `--version` now correctly reports `v0.1.4`
-
-#### 🐛 Bug Fixes
-- Fixed entropy threshold comparison that could fail on systems with unusual `/proc` output
-- Fixed potential duplicate firewall status output on systems with multiple firewall tools
-
-
-### v0.1.3  (Previous Release)
-- Added CPU temperature monitoring, load-per-core alerts, I/O Wait threshold, SYN_RECV flood detection, kernel hardening checks (ASLR, entropy, /tmp noexec), and security audit features
 
 ---
 
@@ -124,7 +126,10 @@ sudo ./healthcheck.sh
 | `--json`, `-j` | Machine-readable JSON output | `./healthcheck.sh --json \| jq .cpu.cpu_usage` |
 | `--log`, `-l` | Save timestamped report to file | `./healthcheck.sh --log` |
 | `--quiet`, `-q` | Suppress sections, show only health verdict | `./healthcheck.sh --quiet` |
+| `--no-color`, `-n` | Disable ANSI colors (for logs/CI) | `./healthcheck.sh --no-color --log` |
+| `--section`, `-s` | Run only specified section | `./healthcheck.sh --section security` |
 | `--version`, `-v` | Print version and exit | `./healthcheck.sh --version` |
+
 
 ### Flag Combinations
 
@@ -155,6 +160,12 @@ sudo ./healthcheck.sh
 
 # Export key metrics to CSV
 ./healthcheck.sh --json | jq -r '[.cpu.cpu_usage, .memory.ram_used_pct, .storage.root_usage] | @csv'
+
+# Quick check of CPU metrics in JSON
+./healthcheck.sh --section cpu --json | jq '.cpu.cpu_usage'
+
+# Save clean log without ANSI codes
+./healthcheck.sh --no-color --log
 ```
 
 ### Cron Integration Examples
