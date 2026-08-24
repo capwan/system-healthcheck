@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ============================================================================
-# system-healthcheck v0.1.4 | Release date : 11.07.2026
+# system-healthcheck v0.1.5 | Release date : 24.08.2026
 # Author : Rahman Samadzada (capwan)
 
 # Exit immediately if a pipeline returns non-zero (strict error handling)
@@ -35,6 +35,8 @@ DANGER_PORTS_LIST="21 23 111 161 445 512 513 514 1433 2049 2375 3306 3389 4444 5
 JSON_MODE=false                   # Output machine-readable JSON if true (via --json flag)
 SAVE_LOG=false                    # Save report to file if true (via --log flag)
 QUIET_MODE=false                  # Suppress section output, show only health verdict (via --quiet/-q flag)
+NO_COLOR="${NO_COLOR:-false}"     # Respect env var, default to false
+RUN_SECTION=""                    # Run only specified section (via --section flag)
 START_TIME_RAW=$(date '+%Y-%m-%d %H:%M:%S')  # Timestamp for report header
 LOG_NAME="system-healthcheck$(date '+%Y%m%d-%H%M%S').log"  # Timestamped log filename
 
@@ -61,9 +63,10 @@ is_greater() {
     awk -v n1="$1" -v n2="$2" 'BEGIN { if (n1 > n2) exit 0; exit 1 }' 2>/dev/null
 }
 
-# Setup ANSI color codes - disabled for JSON mode to avoid escape sequences in output
+# Setup ANSI color codes - disabled for JSON mode or NO_COLOR env var
 setup_colors() {
-    if [[ "$JSON_MODE" == "true" ]]; then
+    # Check both variable and environment variable
+    if [[ "$JSON_MODE" == "true" || "$NO_COLOR" == "true" || "${NO_COLOR:-0}" == "1" ]]; then
         R=''; G=''; Y=''; B=''; NC=''
     else
         R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'
@@ -134,6 +137,7 @@ get_failed_services_details() {
 # SECTION: SYSTEM INFO
 # ============================================================================
 section_system() {
+    local mode="${1:-full}"  # "section" or "full" - controls JSON key output
     local os=$(get_val PRETTY_NAME)
     local host=$(hostname)
     local kernel=$(uname -r)
@@ -207,10 +211,18 @@ section_system() {
     [[ "$fd_pct" -gt 80 ]] && add_alert "FILE DESCRIPTORS: ${fd_pct}% used (${fd_open}/${fd_max})"
 
     if [[ "$JSON_MODE" == "true" ]]; then
-        printf '"system": {"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s", "tainted": %s, "fd_open": %d, "fd_max": %d, "fd_pct": %d}' \
-            "$(json_escape "$os")" "$(json_escape "$host")" "$(json_escape "$up_pretty")" \
-            "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")" "$taint" \
-            "$fd_open" "$fd_max" "$fd_pct"
+        # FIX: If called from --section mode, don't add key prefix (run_main adds it)
+        if [[ "$mode" == "section" ]]; then
+            printf '{"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s", "tainted": %s, "fd_open": %d, "fd_max": %d, "fd_pct": %d}' \
+                "$(json_escape "$os")" "$(json_escape "$host")" "$(json_escape "$up_pretty")" \
+                "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")" "$taint" \
+                "$fd_open" "$fd_max" "$fd_pct"
+        else
+            printf '"system": {"os": "%s", "host": "%s", "uptime": "%s", "virt": "%s", "failed": %d, "ntp": "%s", "tainted": %s, "fd_open": %d, "fd_max": %d, "fd_pct": %d}' \
+                "$(json_escape "$os")" "$(json_escape "$host")" "$(json_escape "$up_pretty")" \
+                "$(json_escape "$virt")" "$failed_c" "$(json_escape "$ntp_active")" "$taint" \
+                "$fd_open" "$fd_max" "$fd_pct"
+        fi
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "${B}=== System Info ===${NC}"
         echo -e "${G}OS:${NC} $os"
@@ -236,6 +248,7 @@ section_system() {
 # SECTION: CPU & LOAD
 # ============================================================================
 section_cpu() {
+    local mode="${1:-full}"  # "section" or "full" - controls JSON key output
     local model=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ //')
     [[ -z "$model" ]] && model=$(uname -m)
 
@@ -309,9 +322,16 @@ section_cpu() {
         add_alert "HIGH I/O WAIT: ${iowait_f}% (disk bottleneck)"
 
     if [[ "$JSON_MODE" == "true" ]]; then
-        printf ', "cpu": {"model": "%s", "cores": %d, "load": "%s", "load_per_core": "%s", "iowait": %d, "steal": %d, "cpu_usage": %d, "temp_celsius": "%s"}' \
-            "$(json_escape "$model")" "$cores" "$(json_escape "$load")" "$load_per_core" \
-            "$iowait_f" "$steal_f" "$cpu_usage" "$cpu_temp"
+        # FIX: If called from --section mode, don't add key prefix (run_main adds it)
+        if [[ "$mode" == "section" ]]; then
+            printf '{"model": "%s", "cores": %d, "load": "%s", "load_per_core": "%s", "iowait": %d, "steal": %d, "cpu_usage": %d, "temp_celsius": "%s"}' \
+                "$(json_escape "$model")" "$cores" "$(json_escape "$load")" "$load_per_core" \
+                "$iowait_f" "$steal_f" "$cpu_usage" "$cpu_temp"
+        else
+            printf ', "cpu": {"model": "%s", "cores": %d, "load": "%s", "load_per_core": "%s", "iowait": %d, "steal": %d, "cpu_usage": %d, "temp_celsius": "%s"}' \
+                "$(json_escape "$model")" "$cores" "$(json_escape "$load")" "$load_per_core" \
+                "$iowait_f" "$steal_f" "$cpu_usage" "$cpu_temp"
+        fi
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== CPU & Load ===${NC}"
         echo -e "${G}Model:${NC} $model"
@@ -339,6 +359,7 @@ section_cpu() {
 # SECTION: MEMORY
 # ============================================================================
 section_memory() {
+    local mode="${1:-full}"  # "section" or "full" - controls JSON key output
     local mem_total=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     local mem_available=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
     local swap_total=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
@@ -363,9 +384,16 @@ section_memory() {
         add_alert "SWAP USAGE: ${swap_used_pct}% (memory pressure)"
 
     if [[ "$JSON_MODE" == "true" ]]; then
-        printf ', "memory": {"ram_total_mb": %d, "ram_used_mb": %d, "ram_used_pct": %d, "swap_total_mb": %d, "swap_used_mb": %d, "swap_used_pct": %d}' \
-            "$ram_total_mb" "$ram_used_mb" "$ram_used_pct" \
-            "$swap_total_mb" "$swap_used_mb" "$swap_used_pct"
+        # FIX: If called from --section mode, don't add key prefix (run_main adds it)
+        if [[ "$mode" == "section" ]]; then
+            printf '{"ram_total_mb": %d, "ram_used_mb": %d, "ram_used_pct": %d, "swap_total_mb": %d, "swap_used_mb": %d, "swap_used_pct": %d}' \
+                "$ram_total_mb" "$ram_used_mb" "$ram_used_pct" \
+                "$swap_total_mb" "$swap_used_mb" "$swap_used_pct"
+        else
+            printf ', "memory": {"ram_total_mb": %d, "ram_used_mb": %d, "ram_used_pct": %d, "swap_total_mb": %d, "swap_used_mb": %d, "swap_used_pct": %d}' \
+                "$ram_total_mb" "$ram_used_mb" "$ram_used_pct" \
+                "$swap_total_mb" "$swap_used_mb" "$swap_used_pct"
+        fi
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Memory ===${NC}"
         safe_exec 2 free -h 2>/dev/null || safe_exec 2 free 2>/dev/null || echo "  free command unavailable"
@@ -377,6 +405,7 @@ section_memory() {
 # SECTION: STORAGE
 # ============================================================================
 section_storage() {
+    local mode="${1:-full}"  # "section" or "full" - controls JSON key output
     # Disk alert: runs in ALL modes (fixes v0.1.2 double-alert bug)
     # check_health_verdict no longer re-checks disk
     local root_usage=$(safe_exec 2 df / 2>/dev/null | tail -1 | awk '{print $5}' | tr -dc '0-9')
@@ -407,7 +436,12 @@ section_storage() {
             first_mount=false
         done < <(safe_exec 2 df -k 2>/dev/null | grep -E '^/dev/')
         mounts_json+="]"
-        printf ', "storage": {"root_usage": %d, "mounts": %s}' "$root_usage" "$mounts_json"
+        # FIX: If called from --section mode, don't add key prefix (run_main adds it)
+        if [[ "$mode" == "section" ]]; then
+            printf '{"root_usage": %d, "mounts": %s}' "$root_usage" "$mounts_json"
+        else
+            printf ', "storage": {"root_usage": %d, "mounts": %s}' "$root_usage" "$mounts_json"
+        fi
 
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Storage ===${NC}"
@@ -426,6 +460,7 @@ section_storage() {
 # SECTION: NETWORK
 # ============================================================================
 section_network() {
+    local mode="${1:-full}"  # "section" or "full" - controls JSON key output
     local gw=$(ip route 2>/dev/null | grep default | awk '{print $3}' | head -n1)
     local dns=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | xargs)
 
@@ -477,10 +512,16 @@ section_network() {
             done < <(awk 'NR>2 && $1 !~ /^lo:/ {gsub(":", "", $1); if ($2+$10>0) print $1, $2, $10}' /proc/net/dev 2>/dev/null)
         fi
         ifaces_json+="]"
-
-        printf ', "network": {"gateway": "%s", "dns": "%s", "established": %d, "syn_recv": %d, "time_wait": %d, "interfaces": %s}' \
-            "$(json_escape "${gw:-N/A}")" "$(json_escape "$dns")" \
-            "$conn_estab" "$conn_synrecv" "$conn_timewait" "$ifaces_json"
+        # FIX: If called from --section mode, don't add key prefix (run_main adds it)
+        if [[ "$mode" == "section" ]]; then
+            printf '{"gateway": "%s", "dns": "%s", "established": %d, "syn_recv": %d, "time_wait": %d, "interfaces": %s}' \
+                "$(json_escape "${gw:-N/A}")" "$(json_escape "$dns")" \
+                "$conn_estab" "$conn_synrecv" "$conn_timewait" "$ifaces_json"
+        else
+            printf ', "network": {"gateway": "%s", "dns": "%s", "established": %d, "syn_recv": %d, "time_wait": %d, "interfaces": %s}' \
+                "$(json_escape "${gw:-N/A}")" "$(json_escape "$dns")" \
+                "$conn_estab" "$conn_synrecv" "$conn_timewait" "$ifaces_json"
+        fi
 
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Network ===${NC}"
@@ -508,6 +549,7 @@ section_network() {
 # SECTION: SECURITY & UPDATES
 # ============================================================================
 section_security() {
+    local mode="${1:-full}"  # "section" or "full" - controls JSON key output
     # Firewall status
     local fw="OFF"
     if command -v firewall-cmd >/dev/null 2>&1; then
@@ -691,11 +733,20 @@ section_security() {
         fi
         active_json+="]"
 
-        printf ', "security": {"firewall": "%s", "ssh_root": "%s", "ssh_pwauth": "%s", "updates": %d, "ssh_failures": %d, "top_ips": %s, "active_sessions": %s, "uid0_extra": "%s", "aslr": "%s", "entropy": "%s", "tmp_noexec": "%s", "selinux": "%s", "apparmor": "%s"}' \
-            "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$(json_escape "$ssh_pwauth")" \
-            "$upd" "$ssh_total_failures" "$ip_json" "$active_json" \
-            "$(json_escape "$uid0_extra")" "$(json_escape "$aslr")" "$(json_escape "$entropy")" \
-            "$(json_escape "$tmp_noexec")" "$(json_escape "$selinux_status")" "$(json_escape "$apparmor_status")"
+        # FIX: If called from --section mode, don't add key prefix (run_main adds it)
+        if [[ "$mode" == "section" ]]; then
+            printf '{"firewall": "%s", "ssh_root": "%s", "ssh_pwauth": "%s", "updates": %d, "ssh_failures": %d, "top_ips": %s, "active_sessions": %s, "uid0_extra": "%s", "aslr": "%s", "entropy": "%s", "tmp_noexec": "%s", "selinux": "%s", "apparmor": "%s"}' \
+                "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$(json_escape "$ssh_pwauth")" \
+                "$upd" "$ssh_total_failures" "$ip_json" "$active_json" \
+                "$(json_escape "$uid0_extra")" "$(json_escape "$aslr")" "$(json_escape "$entropy")" \
+                "$(json_escape "$tmp_noexec")" "$(json_escape "$selinux_status")" "$(json_escape "$apparmor_status")"
+        else
+            printf ', "security": {"firewall": "%s", "ssh_root": "%s", "ssh_pwauth": "%s", "updates": %d, "ssh_failures": %d, "top_ips": %s, "active_sessions": %s, "uid0_extra": "%s", "aslr": "%s", "entropy": "%s", "tmp_noexec": "%s", "selinux": "%s", "apparmor": "%s"}' \
+                "$(json_escape "$fw")" "$(json_escape "$ssh_root")" "$(json_escape "$ssh_pwauth")" \
+                "$upd" "$ssh_total_failures" "$ip_json" "$active_json" \
+                "$(json_escape "$uid0_extra")" "$(json_escape "$aslr")" "$(json_escape "$entropy")" \
+                "$(json_escape "$tmp_noexec")" "$(json_escape "$selinux_status")" "$(json_escape "$apparmor_status")"
+        fi
 
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "\n${B}=== Security & Updates ===${NC}"
@@ -830,8 +881,10 @@ while [ "$#" -gt 0 ]; do
         -j|--json)    JSON_MODE=true ;;
         -l|--log)     SAVE_LOG=true ;;
         -q|--quiet)   QUIET_MODE=true ;;
+        -n|--no-color|--no-colour) NO_COLOR=true ;;
+        -s|--section) RUN_SECTION="$2"; shift ;;
         -v|--version)
-            echo "system-healthcheck v0.1.4"
+            echo "system-healthcheck v0.1.5"
             exit 0
             ;;
         -h|--help)
@@ -841,6 +894,7 @@ while [ "$#" -gt 0 ]; do
             echo "  -j, --json      Output machine-readable JSON"
             echo "  -l, --log       Save report to timestamped log file"
             echo "  -q, --quiet     Show only health verdict and alerts (suppress section output)"
+            echo "  -n, --no-color  Disable ANSI color codes (for logs/CI)"
             echo "  -v, --version   Show version and exit"
             echo "  -h, --help      Show this help message"
             echo ""
@@ -864,11 +918,20 @@ while [ "$#" -gt 0 ]; do
             echo "  --json | jq .memory      Parse memory metrics"
             echo "  --json | jq .security    Parse security metrics"
             echo ""
+            echo "Section mode examples:"
+            echo "  ./healthcheck.sh --section cpu                 # Check CPU only"
+            echo "  ./healthcheck.sh --section security --json     # Security audit in JSON"
+            echo ""
+            echo "Color control:"
+            echo "  ./healthcheck.sh --no-color --log              # Clean output for logs"
+            echo "  NO_COLOR=1 ./healthcheck.sh                    # Disable colors via env"
+            echo ""
             echo "JSON parsing examples (requires jq):"
             echo "  ./healthcheck.sh --json | jq '.cpu.cpu_usage'          # Get CPU usage %"
             echo "  ./healthcheck.sh --json | jq '.health.status'          # Get health status"
             echo "  ./healthcheck.sh --json | jq '.security.ssh_failures'  # Get SSH failure count"
             echo "  ./healthcheck.sh --json | jq 'if .health.status == \"CRITICAL\" then 1 else 0 end'  # Exit code for automation"
+            echo "  ./healthcheck.sh --json | jq '.version'         # Get script version"
             echo ""
             echo "Cron examples:"
             echo "  # Alert on any issue (exit code 1 = problems found)"
@@ -889,8 +952,38 @@ setup_colors
 check_root
 
 run_main() {
+    # Handle --section mode: run single section and exit
+    if [[ -n "$RUN_SECTION" ]]; then
+        if [[ "$JSON_MODE" == "true" ]]; then
+            # Valid JSON wrapper for single section
+            echo -n '{"version": "v0.1.5", '
+            case "$RUN_SECTION" in
+                system) printf '"system": '; section_system "section" ;;
+                cpu) printf '"cpu": '; section_cpu "section" ;;
+                memory) printf '"memory": '; section_memory "section" ;;
+                storage) printf '"storage": '; section_storage "section" ;;
+                network) printf '"network": '; section_network "section" ;;
+                security) printf '"security": '; section_security "section" ;;
+                *) echo "Unknown section: $RUN_SECTION" >&2; exit 1 ;;
+            esac
+            echo '}'
+        else
+            case "$RUN_SECTION" in
+                system) section_system ;;
+                cpu) section_cpu ;;
+                memory) section_memory ;;
+                storage) section_storage ;;
+                network) section_network ;;
+                security) section_security ;;
+                *) echo "Unknown section: $RUN_SECTION" >&2; exit 1 ;;
+            esac
+        fi
+        exit 0
+    fi
+
+    # Full run
     if [[ "$JSON_MODE" == "true" ]]; then
-        echo -n "{"
+        echo -n '{"version": "v0.1.5", '
     elif [[ "$QUIET_MODE" != "true" ]]; then
         echo -e "${B}================================================================${NC}"
         echo -e "${B}            SYSTEM AUDIT REPORT | $START_TIME_RAW ${NC}"
